@@ -5,10 +5,15 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, Request
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "app.db"))
+# 타임라인 사진 저장 폴더. 지정하지 않으면 DB 파일 옆의 uploads 폴더를 씁니다.
+UPLOAD_DIR = os.environ.get("UPLOAD_DIR", os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "uploads"))
+MEDIA_MAX_BYTES = 5 * 1024 * 1024
+MEDIA_MAX_PER_POST = 5
 def get_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -34,6 +39,10 @@ def init_db():
             reflection TEXT DEFAULT '', completed_at TEXT)""")
         conn.execute("""CREATE TABLE IF NOT EXISTS app_state (
             state_key TEXT PRIMARY KEY, state_value TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+        # app_state는 state_key만 기본키라 사용자가 둘 이상이면 저장이 실패해서, 사용자별 표를 따로 둡니다.
+        conn.execute("""CREATE TABLE IF NOT EXISTS user_app_state (
+            user_id INTEGER NOT NULL, state_key TEXT NOT NULL, state_value TEXT NOT NULL, updated_at TEXT NOT NULL,
+            PRIMARY KEY(user_id, state_key))""")
         conn.execute("""CREATE TABLE IF NOT EXISTS quest_progress (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, quest_key TEXT NOT NULL,
             title TEXT NOT NULL, role TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0,
@@ -48,6 +57,9 @@ def init_db():
         conn.execute("""CREATE TABLE IF NOT EXISTS meetup_interests (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, meetup_key TEXT NOT NULL,
             created_at TEXT NOT NULL, UNIQUE(user_id, meetup_key))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS post_media (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, post_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+            file_name TEXT NOT NULL, content_type TEXT NOT NULL, size_bytes INTEGER NOT NULL, created_at TEXT NOT NULL)""")
         conn.execute("""CREATE TABLE IF NOT EXISTS timeline_posts (
             id INTEGER PRIMARY KEY AUTOINCREMENT, author_id INTEGER NOT NULL, quest_key TEXT NOT NULL,
             title TEXT NOT NULL, body TEXT DEFAULT '', result_summary TEXT DEFAULT '', created_at TEXT NOT NULL,
@@ -146,7 +158,8 @@ def allowed_post(post_id: int, user, conn):
 def post_dict(row, user_id, conn):
     post_id = row["id"]
     counts = conn.execute("SELECT (SELECT COUNT(*) FROM post_likes WHERE post_id = ?) AS likes, (SELECT COUNT(*) FROM post_comments WHERE post_id = ? AND deleted_at IS NULL) AS comments, EXISTS(SELECT 1 FROM post_likes WHERE post_id = ? AND user_id = ?) AS liked", (post_id, post_id, post_id, user_id)).fetchone()
-    return dict(row) | {"is_mine": row["author_id"] == user_id, "like_count": counts["likes"], "comment_count": counts["comments"], "liked_by_me": bool(counts["liked"])}
+    media = conn.execute("SELECT id, content_type FROM post_media WHERE post_id = ? ORDER BY id", (post_id,)).fetchall()
+    return dict(row) | {"is_mine": row["author_id"] == user_id, "like_count": counts["likes"], "comment_count": counts["comments"], "liked_by_me": bool(counts["liked"]), "media": [dict(item) for item in media]}
 class SignUpInput(BaseModel): name: str = Field(min_length=1, max_length=30); email: str = Field(min_length=3, max_length=100); password: str = Field(min_length=4, max_length=100); role: str; partner_code: str = ""
 class LoginInput(BaseModel): email: str; password: str
 class LinkInput(BaseModel): partner_code: str
@@ -276,8 +289,9 @@ def complete_quest(payload: QuestProgressInput, user=Depends(current_user)):
     with get_db() as conn:
         conn.execute("""INSERT INTO quest_progress (user_id,quest_key,title,role,completed,reflection,result_summary,completed_at,is_shared,media_kind,media_count) VALUES (?,?,?,?,1,?,?,?,?,?,?) ON CONFLICT(user_id,quest_key) DO UPDATE SET completed=1, reflection=excluded.reflection, result_summary=excluded.result_summary, completed_at=excluded.completed_at, is_shared=excluded.is_shared, media_kind=excluded.media_kind, media_count=excluded.media_count""", (user["id"],payload.quest_key,payload.title,user["role"],payload.reflection.strip(),payload.result_summary.strip(),timestamp,int(payload.is_shared),payload.media_kind,max(0,payload.media_count)))
         row = conn.execute("SELECT * FROM quest_progress WHERE user_id = ? AND quest_key = ?", (user["id"], payload.quest_key)).fetchone()
-        if payload.is_shared: conn.execute("INSERT INTO timeline_posts (author_id,quest_key,title,body,result_summary,created_at) VALUES (?,?,?,?,?,?)", (user["id"], payload.quest_key, payload.title, payload.reflection.strip(), payload.result_summary.strip(), timestamp))
-    return progress_dict(row)
+        post_id = None
+        if payload.is_shared: post_id = conn.execute("INSERT INTO timeline_posts (author_id,quest_key,title,body,result_summary,created_at) VALUES (?,?,?,?,?,?)", (user["id"], payload.quest_key, payload.title, payload.reflection.strip(), payload.result_summary.strip(), timestamp)).lastrowid
+    return progress_dict(row) | {"post_id": post_id}
 @app.get("/api/timeline")
 def timeline(before_id: Optional[int] = None, limit: int = 20, user=Depends(current_user)):
     safe_limit = min(max(limit, 1), 20); ids = [user["id"]] + ([user["linked_user_id"]] if user["linked_user_id"] else []); marks = ",".join("?" for _ in ids)
@@ -322,6 +336,40 @@ def delete_post(post_id: int, user=Depends(current_user)):
         if row["author_id"] != user["id"]: raise HTTPException(status_code=403, detail="내 게시물만 삭제할 수 있습니다.")
         conn.execute("UPDATE timeline_posts SET deleted_at = ? WHERE id = ?", (now(),post_id))
     return {"ok": True}
+def image_type(data: bytes):
+    if data.startswith(b"\xff\xd8\xff"): return "image/jpeg", ".jpg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"): return "image/png", ".png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP": return "image/webp", ".webp"
+    return None, None
+@app.post("/api/timeline/{post_id}/media")
+async def upload_media(post_id: int, request: Request, user=Depends(current_user)):
+    # 사진 파일 자체를 요청 본문으로 받습니다. (추가 패키지 없이 동작)
+    with get_db() as conn:
+        post = allowed_post(post_id, user, conn)
+        if post["author_id"] != user["id"]: raise HTTPException(status_code=403, detail="내 게시물에만 사진을 올릴 수 있습니다.")
+        if conn.execute("SELECT COUNT(*) FROM post_media WHERE post_id = ?", (post_id,)).fetchone()[0] >= MEDIA_MAX_PER_POST:
+            raise HTTPException(status_code=400, detail=f"사진은 게시물당 {MEDIA_MAX_PER_POST}장까지 올릴 수 있어요.")
+    data = b""
+    async for chunk in request.stream():
+        data += chunk
+        if len(data) > MEDIA_MAX_BYTES: raise HTTPException(status_code=400, detail="사진은 한 장에 5MB까지 올릴 수 있어요.")
+    content_type, ext = image_type(data)
+    if not content_type: raise HTTPException(status_code=400, detail="jpg, png, webp 사진만 올릴 수 있어요.")
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    file_name = secrets.token_hex(16) + ext
+    with open(os.path.join(UPLOAD_DIR, file_name), "wb") as f: f.write(data)
+    with get_db() as conn:
+        media_id = conn.execute("INSERT INTO post_media (post_id,user_id,file_name,content_type,size_bytes,created_at) VALUES (?,?,?,?,?,?)", (post_id, user["id"], file_name, content_type, len(data), now())).lastrowid
+    return {"id": media_id, "content_type": content_type}
+@app.get("/api/media/{media_id}")
+def get_media(media_id: int, user=Depends(current_user)):
+    with get_db() as conn:
+        media = conn.execute("SELECT * FROM post_media WHERE id = ?", (media_id,)).fetchone()
+        if not media: raise HTTPException(status_code=404, detail="사진을 찾을 수 없습니다.")
+        allowed_post(media["post_id"], user, conn)
+    path = os.path.join(UPLOAD_DIR, os.path.basename(media["file_name"]))
+    if not os.path.exists(path): raise HTTPException(status_code=404, detail="사진 파일을 찾을 수 없습니다.")
+    return FileResponse(path, media_type=media["content_type"], headers={"Cache-Control": "private, max-age=86400"})
 ARTICLE_CATEGORIES = ("인지 건강", "생활 습관", "대화 팁", "공지")
 def article_dict(row): return dict(row)
 def article_payload(payload: ArticleInput):
@@ -440,13 +488,13 @@ def detail_activity(activity_id: int, user=Depends(current_user)):
     return dict(row) | {"is_correct": bool(row["is_correct"])}
 @app.get("/api/app-state")
 def get_app_state(user=Depends(current_user)):
-    with get_db() as conn: rows = conn.execute("SELECT state_key,state_value FROM app_state WHERE user_id = ?", (user["id"],)).fetchall()
+    with get_db() as conn: rows = conn.execute("SELECT state_key,state_value FROM user_app_state WHERE user_id = ?", (user["id"],)).fetchall()
     values = {row["state_key"]: row["state_value"] for row in rows}; return {"mode": values.get("mode", "home"), "step": int(values.get("step", "0"))}
 @app.put("/api/app-state")
 def save_app_state(payload: AppStateInput, user=Depends(current_user)):
     with get_db() as conn:
         for key, value in (("mode",payload.mode),("step",str(max(0,payload.step)))):
-            conn.execute("DELETE FROM app_state WHERE user_id = ? AND state_key = ?", (user["id"],key)); conn.execute("INSERT INTO app_state (state_key,state_value,updated_at,user_id) VALUES (?,?,?,?)", (key,value,now(),user["id"]))
+            conn.execute("INSERT OR REPLACE INTO user_app_state (user_id,state_key,state_value,updated_at) VALUES (?,?,?,?)", (user["id"],key,value,now()))
     return {"mode": payload.mode, "step": max(0,payload.step)}
 @app.get("/api/guardian/report")
 def guardian_report(days: int = 7, user=Depends(current_user)):
