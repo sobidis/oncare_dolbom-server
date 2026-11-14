@@ -2,6 +2,10 @@ import os
 import sqlite3
 import secrets
 import hashlib
+import re
+import smtplib
+import time
+from email.message import EmailMessage
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Optional
@@ -14,6 +18,17 @@ DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(os.path.abspath
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "uploads"))
 MEDIA_MAX_BYTES = 5 * 1024 * 1024
 MEDIA_MAX_PER_POST = 5
+# 메일 발송 설정 (Gmail/네이버 메일의 앱 비밀번호). 비어 있으면 이메일 인증 없이 가입됩니다.
+SMTP_HOST = os.environ.get("SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+MAIL_FROM = os.environ.get("MAIL_FROM", "") or SMTP_USER
+MAIL_DEBUG = os.environ.get("MAIL_DEBUG", "") == "1"  # 시험용: 메일 대신 서버 로그에 코드를 남깁니다.
+CODE_TTL_SECONDS = 10 * 60
+CODE_MAX_ATTEMPTS = 5
+CODE_RESEND_SECONDS = 60
+CODE_MAX_PER_HOUR = 5
 def get_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -57,6 +72,9 @@ def init_db():
         conn.execute("""CREATE TABLE IF NOT EXISTS meetup_interests (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, meetup_key TEXT NOT NULL,
             created_at TEXT NOT NULL, UNIQUE(user_id, meetup_key))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS email_codes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, purpose TEXT NOT NULL, code_hash TEXT NOT NULL,
+            expires_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, used_at INTEGER, created_at INTEGER NOT NULL)""")
         conn.execute("""CREATE TABLE IF NOT EXISTS post_media (
             id INTEGER PRIMARY KEY AUTOINCREMENT, post_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
             file_name TEXT NOT NULL, content_type TEXT NOT NULL, size_bytes INTEGER NOT NULL, created_at TEXT NOT NULL)""")
@@ -80,6 +98,7 @@ def init_db():
             ("quest_progress", "is_shared", "INTEGER NOT NULL DEFAULT 0"), ("quest_progress", "media_kind", "TEXT DEFAULT ''"),
             ("quest_progress", "media_count", "INTEGER NOT NULL DEFAULT 0"),
             ("timeline_posts", "source_progress_id", "INTEGER UNIQUE"),
+            ("users", "email_verified", "INTEGER NOT NULL DEFAULT 0"),
         ]: add_column(conn, table, column, definition)
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -120,7 +139,7 @@ def require_admin(user=Depends(current_user)):
     if not is_admin(user): raise HTTPException(status_code=403, detail="관리자만 글을 관리할 수 있습니다.")
     return user
 def profile(row):
-    return {"id": row["id"], "name": row["name"], "email": row["email"], "role": row["role"], "invite_code": row["invite_code"], "linked_user_id": row["linked_user_id"], "is_linked": bool(row["linked_user_id"]), "is_admin": is_admin(row)}
+    return {"id": row["id"], "name": row["name"], "email": row["email"], "role": row["role"], "invite_code": row["invite_code"], "linked_user_id": row["linked_user_id"], "is_linked": bool(row["linked_user_id"]), "is_admin": is_admin(row), "email_verified": bool(row["email_verified"]) if "email_verified" in row.keys() else False}
 def activity_owner(user): return user["linked_user_id"] if user["role"] == "guardian" and user["linked_user_id"] else user["id"]
 RELATION_PERIOD_DAYS = 7
 GUARDIAN_OVERVIEW_DAYS = 7
@@ -160,7 +179,7 @@ def post_dict(row, user_id, conn):
     counts = conn.execute("SELECT (SELECT COUNT(*) FROM post_likes WHERE post_id = ?) AS likes, (SELECT COUNT(*) FROM post_comments WHERE post_id = ? AND deleted_at IS NULL) AS comments, EXISTS(SELECT 1 FROM post_likes WHERE post_id = ? AND user_id = ?) AS liked", (post_id, post_id, post_id, user_id)).fetchone()
     media = conn.execute("SELECT id, content_type FROM post_media WHERE post_id = ? ORDER BY id", (post_id,)).fetchall()
     return dict(row) | {"is_mine": row["author_id"] == user_id, "like_count": counts["likes"], "comment_count": counts["comments"], "liked_by_me": bool(counts["liked"]), "media": [dict(item) for item in media]}
-class SignUpInput(BaseModel): name: str = Field(min_length=1, max_length=30); email: str = Field(min_length=3, max_length=100); password: str = Field(min_length=4, max_length=100); role: str; partner_code: str = ""
+class SignUpInput(BaseModel): name: str = Field(min_length=1, max_length=30); email: str = Field(min_length=3, max_length=100); password: str = Field(min_length=4, max_length=100); role: str; partner_code: str = ""; email_code: str = ""
 class LoginInput(BaseModel): email: str; password: str
 class LinkInput(BaseModel): partner_code: str
 class ActivityInput(BaseModel): activity_type: str; question: str; answer: str; correct_answer: str; is_correct: bool; encouragement: str
@@ -191,7 +210,11 @@ def signup(payload: SignUpInput):
             if partner["role"] == payload.role: raise HTTPException(status_code=400, detail="보호자와 시니어 코드는 서로 연결할 수 있어요.")
             if partner["linked_user_id"]: raise HTTPException(status_code=400, detail="이미 연결된 코드입니다.")
             linked_id = partner["id"]
-        try: cursor = conn.execute("INSERT INTO users (name,email,password_hash,role,invite_code,linked_user_id,created_at) VALUES (?,?,?,?,?,?,?)", (payload.name.strip(), payload.email.strip().lower(), password_hash(payload.password), payload.role, make_code(conn), linked_id, now()))
+        verified = 0
+        if mail_enabled():
+            if conn.execute("SELECT 1 FROM users WHERE email = ?", (payload.email.strip().lower(),)).fetchone(): raise HTTPException(status_code=400, detail="이미 사용 중인 이메일입니다.")
+            check_code(conn, payload.email, "signup", payload.email_code); verified = 1
+        try: cursor = conn.execute("INSERT INTO users (name,email,password_hash,role,invite_code,linked_user_id,created_at,email_verified) VALUES (?,?,?,?,?,?,?,?)", (payload.name.strip(), payload.email.strip().lower(), password_hash(payload.password), payload.role, make_code(conn), linked_id, now(), verified))
         except sqlite3.IntegrityError: raise HTTPException(status_code=400, detail="이미 사용 중인 이메일입니다.")
         user_id = cursor.lastrowid
         if linked_id: conn.execute("UPDATE users SET linked_user_id = ? WHERE id = ?", (user_id, linked_id))
@@ -218,6 +241,161 @@ def link_partner(payload: LinkInput, user=Depends(current_user)):
 def logout(authorization: Optional[str] = Header(default=None)):
     if authorization and authorization.startswith("Bearer "):
         with get_db() as conn: conn.execute("DELETE FROM sessions WHERE token = ?", (authorization.removeprefix("Bearer "),))
+    return {"ok": True}
+# ---------- 이메일 인증 · 비밀번호 재설정 · 계정 설정 ----------
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+def mail_enabled(): return MAIL_DEBUG or bool(SMTP_HOST and SMTP_USER and SMTP_PASSWORD)
+def normalize_email(email: str):
+    email = (email or "").strip().lower()
+    if not EMAIL_RE.match(email): raise HTTPException(status_code=400, detail="이메일 형식을 확인해 주세요.")
+    return email
+def code_hash(email: str, purpose: str, code: str): return hashlib.sha256(f"{email}:{purpose}:{code.strip()}".encode()).hexdigest()
+def mask_email(email: str):
+    local, _, domain = email.partition("@")
+    return (local[:2] + "***" if len(local) > 2 else local[:1] + "***") + "@" + domain
+def send_mail(to: str, subject: str, body: str):
+    if MAIL_DEBUG:
+        print(f"[MAIL_DEBUG] to={to} subject={subject}\n{body}", flush=True); return
+    msg = EmailMessage(); msg["Subject"] = subject; msg["From"] = f"함께 돌봄 <{MAIL_FROM}>"; msg["To"] = to; msg.set_content(body)
+    try:
+        if SMTP_PORT == 465:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as server: server.login(SMTP_USER, SMTP_PASSWORD); server.send_message(msg)
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server: server.starttls(); server.login(SMTP_USER, SMTP_PASSWORD); server.send_message(msg)
+    except Exception as error:
+        print(f"[MAIL_ERROR] {error!r}", flush=True)
+        raise HTTPException(status_code=503, detail="메일을 보내지 못했어요. 잠시 후 다시 시도해 주세요.")
+def issue_code(conn, email: str, purpose: str):
+    stamp = int(time.time())
+    last = conn.execute("SELECT created_at FROM email_codes WHERE email = ? AND purpose = ? ORDER BY id DESC LIMIT 1", (email, purpose)).fetchone()
+    if last and stamp - last["created_at"] < CODE_RESEND_SECONDS: raise HTTPException(status_code=429, detail="1분 뒤에 다시 요청해 주세요.")
+    if conn.execute("SELECT COUNT(*) FROM email_codes WHERE email = ? AND created_at > ?", (email, stamp - 3600)).fetchone()[0] >= CODE_MAX_PER_HOUR:
+        raise HTTPException(status_code=429, detail="요청이 너무 많아요. 1시간 뒤에 다시 시도해 주세요.")
+    code = f"{secrets.randbelow(10**6):06d}"
+    conn.execute("INSERT INTO email_codes (email,purpose,code_hash,expires_at,created_at) VALUES (?,?,?,?,?)", (email, purpose, code_hash(email, purpose, code), stamp + CODE_TTL_SECONDS, stamp))
+    return code
+def check_code(conn, email: str, purpose: str, code: str):
+    email = normalize_email(email)
+    if not (code or "").strip(): raise HTTPException(status_code=400, detail="이메일로 받은 인증 코드를 입력해 주세요.")
+    row = conn.execute("SELECT * FROM email_codes WHERE email = ? AND purpose = ? AND used_at IS NULL ORDER BY id DESC LIMIT 1", (email, purpose)).fetchone()
+    if not row or row["expires_at"] < time.time(): raise HTTPException(status_code=400, detail="인증 코드가 만료되었어요. 코드를 다시 받아 주세요.")
+    if row["attempts"] >= CODE_MAX_ATTEMPTS: raise HTTPException(status_code=400, detail="여러 번 틀렸어요. 코드를 다시 받아 주세요.")
+    if not secrets.compare_digest(row["code_hash"], code_hash(email, purpose, code or "")):
+        conn.execute("UPDATE email_codes SET attempts = attempts + 1 WHERE id = ?", (row["id"],)); conn.commit()
+        raise HTTPException(status_code=400, detail="인증 코드가 맞지 않아요.")
+    conn.execute("UPDATE email_codes SET used_at = ? WHERE id = ?", (int(time.time()), row["id"]))
+CODE_MAIL = {
+    "signup": ("[함께 돌봄] 가입 인증 코드", "함께 돌봄 가입 인증 코드는 {code} 입니다.\n10분 안에 앱에 입력해 주세요.\n\n본인이 요청하지 않았다면 이 메일은 무시해 주세요."),
+    "verify": ("[함께 돌봄] 이메일 인증 코드", "함께 돌봄 이메일 인증 코드는 {code} 입니다.\n10분 안에 앱에 입력해 주세요."),
+    "reset": ("[함께 돌봄] 비밀번호 재설정 코드", "함께 돌봄 비밀번호 재설정 코드는 {code} 입니다.\n10분 안에 앱에 입력해 주세요.\n\n본인이 요청하지 않았다면 이 메일은 무시해 주세요. 비밀번호는 바뀌지 않아요."),
+}
+def mail_code(email: str, purpose: str):
+    with get_db() as conn: code = issue_code(conn, email, purpose)
+    subject, body = CODE_MAIL[purpose]; send_mail(email, subject, body.format(code=code))
+class EmailCodeInput(BaseModel): email: str; purpose: str
+class PasswordResetInput(BaseModel): email: str; code: str; new_password: str = Field(min_length=4, max_length=100)
+class FindEmailInput(BaseModel): name: str = Field(min_length=1, max_length=30); partner_email: str
+class NameInput(BaseModel): name: str = Field(min_length=1, max_length=30)
+class PasswordChangeInput(BaseModel): current_password: str; new_password: str = Field(min_length=4, max_length=100)
+class CodeInput(BaseModel): code: str
+class RoleInput(BaseModel): role: str
+class DeleteAccountInput(BaseModel): password: str
+@app.get("/api/auth/config")
+def auth_config(): return {"email_verification": mail_enabled()}
+@app.post("/api/auth/email-code")
+def request_email_code(payload: EmailCodeInput):
+    email = normalize_email(payload.email)
+    if payload.purpose == "signup":
+        if not mail_enabled(): raise HTTPException(status_code=400, detail="지금은 이메일 인증 없이 가입할 수 있어요.")
+        with get_db() as conn:
+            if conn.execute("SELECT 1 FROM users WHERE email = ?", (email,)).fetchone(): raise HTTPException(status_code=400, detail="이미 사용 중인 이메일입니다.")
+        mail_code(email, "signup"); return {"ok": True, "message": "인증 코드를 보냈어요. 메일함을 확인해 주세요."}
+    if payload.purpose == "reset":
+        if not mail_enabled(): raise HTTPException(status_code=400, detail="지금은 메일로 재설정할 수 없어요. 관리자에게 문의해 주세요.")
+        with get_db() as conn: user = conn.execute("SELECT email_verified FROM users WHERE email = ?", (email,)).fetchone()
+        # 가입 여부가 드러나지 않도록 결과와 상관없이 같은 안내를 돌려줍니다.
+        if user and user["email_verified"]: mail_code(email, "reset")
+        return {"ok": True, "message": "인증된 이메일로 가입한 계정이라면 재설정 코드를 보냈어요. 메일함을 확인해 주세요."}
+    raise HTTPException(status_code=400, detail="요청 종류를 확인해 주세요.")
+@app.post("/api/auth/password-reset")
+def reset_password(payload: PasswordResetInput):
+    email = normalize_email(payload.email)
+    with get_db() as conn:
+        user = conn.execute("SELECT * FROM users WHERE email = ? AND email_verified = 1", (email,)).fetchone()
+        if not user: raise HTTPException(status_code=400, detail="인증 코드가 만료되었어요. 코드를 다시 받아 주세요.")
+        check_code(conn, email, "reset", payload.code)
+        conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (password_hash(payload.new_password), user["id"]))
+        conn.execute("DELETE FROM sessions WHERE user_id = ?", (user["id"],))
+    return {"ok": True}
+@app.post("/api/auth/find-email")
+def find_email(payload: FindEmailInput):
+    partner_email = normalize_email(payload.partner_email)
+    with get_db() as conn:
+        partner = conn.execute("SELECT linked_user_id FROM users WHERE email = ?", (partner_email,)).fetchone()
+        user = conn.execute("SELECT email, name FROM users WHERE id = ?", (partner["linked_user_id"],)).fetchone() if partner and partner["linked_user_id"] else None
+    if not user or user["name"].strip() != payload.name.strip(): raise HTTPException(status_code=404, detail="일치하는 계정을 찾지 못했어요. 이름과 가족 이메일을 확인해 주세요.")
+    return {"email_hint": mask_email(user["email"])}
+@app.get("/api/account")
+def account(user=Depends(current_user)):
+    with get_db() as conn: partner = conn.execute("SELECT name, email, role FROM users WHERE id = ?", (user["linked_user_id"],)).fetchone() if user["linked_user_id"] else None
+    return {"user": profile(user), "partner": dict(partner) if partner else None, "mail_enabled": mail_enabled()}
+@app.patch("/api/account/name")
+def change_name(payload: NameInput, user=Depends(current_user)):
+    name = payload.name.strip()
+    if not name: raise HTTPException(status_code=400, detail="이름을 입력해 주세요.")
+    with get_db() as conn: conn.execute("UPDATE users SET name = ? WHERE id = ?", (name, user["id"])); row = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+    return {"user": profile(row)}
+@app.post("/api/account/password")
+def change_password(payload: PasswordChangeInput, user=Depends(current_user), authorization: Optional[str] = Header(default=None)):
+    if not password_ok(payload.current_password, user["password_hash"]): raise HTTPException(status_code=400, detail="지금 비밀번호가 맞지 않아요.")
+    token = (authorization or "").removeprefix("Bearer ")
+    with get_db() as conn:
+        conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (password_hash(payload.new_password), user["id"]))
+        conn.execute("DELETE FROM sessions WHERE user_id = ? AND token != ?", (user["id"], token))
+    return {"ok": True}
+@app.post("/api/account/email-code")
+def request_verify_code(user=Depends(current_user)):
+    if not mail_enabled(): raise HTTPException(status_code=400, detail="아직 메일 발송이 설정되지 않았어요.")
+    if user["email_verified"]: raise HTTPException(status_code=400, detail="이미 인증된 이메일이에요.")
+    mail_code(user["email"], "verify"); return {"ok": True, "message": "인증 코드를 보냈어요. 메일함을 확인해 주세요."}
+@app.post("/api/account/verify-email")
+def verify_email(payload: CodeInput, user=Depends(current_user)):
+    with get_db() as conn:
+        check_code(conn, user["email"], "verify", payload.code)
+        conn.execute("UPDATE users SET email_verified = 1 WHERE id = ?", (user["id"],)); row = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+    return {"user": profile(row)}
+@app.post("/api/account/unlink")
+def unlink(user=Depends(current_user)):
+    if not user["linked_user_id"]: raise HTTPException(status_code=400, detail="연결된 가족이 없어요.")
+    with get_db() as conn:
+        conn.execute("UPDATE users SET linked_user_id = NULL WHERE id IN (?, ?)", (user["id"], user["linked_user_id"])); row = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+    return {"user": profile(row)}
+@app.post("/api/account/role")
+def change_role(payload: RoleInput, user=Depends(current_user)):
+    if payload.role not in ("guardian", "senior"): raise HTTPException(status_code=400, detail="모드를 다시 선택해 주세요.")
+    if user["linked_user_id"]: raise HTTPException(status_code=400, detail="가족 연결을 해제한 뒤 모드를 바꿀 수 있어요.")
+    with get_db() as conn: conn.execute("UPDATE users SET role = ? WHERE id = ?", (payload.role, user["id"])); row = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+    return {"user": profile(row)}
+@app.post("/api/account/delete")
+def delete_account(payload: DeleteAccountInput, user=Depends(current_user)):
+    if not password_ok(payload.password, user["password_hash"]): raise HTTPException(status_code=400, detail="비밀번호가 맞지 않아요.")
+    uid = user["id"]
+    with get_db() as conn:
+        post_ids = [row["id"] for row in conn.execute("SELECT id FROM timeline_posts WHERE author_id = ?", (uid,)).fetchall()]
+        marks = ",".join("?" for _ in post_ids) or "NULL"
+        files = [row["file_name"] for row in conn.execute(f"SELECT file_name FROM post_media WHERE user_id = ? OR post_id IN ({marks})", (uid, *post_ids)).fetchall()]
+        conn.execute(f"DELETE FROM post_media WHERE user_id = ? OR post_id IN ({marks})", (uid, *post_ids))
+        conn.execute(f"DELETE FROM post_likes WHERE user_id = ? OR post_id IN ({marks})", (uid, *post_ids))
+        conn.execute(f"DELETE FROM post_comments WHERE user_id = ? OR post_id IN ({marks})", (uid, *post_ids))
+        conn.execute("DELETE FROM timeline_posts WHERE author_id = ?", (uid,))
+        for table in ("sessions", "activities", "quests", "app_state", "user_app_state", "quest_progress", "mood_checkins", "meetup_interests"):
+            conn.execute(f"DELETE FROM {table} WHERE user_id = ?", (uid,))
+        conn.execute("DELETE FROM email_codes WHERE email = ?", (user["email"],))
+        conn.execute("UPDATE users SET linked_user_id = NULL WHERE linked_user_id = ?", (uid,))
+        conn.execute("DELETE FROM users WHERE id = ?", (uid,))
+    for name in files:
+        try: os.remove(os.path.join(UPLOAD_DIR, os.path.basename(name)))
+        except OSError: pass
     return {"ok": True}
 @app.get("/api/meetups/interests")
 def meetup_interests(user=Depends(current_user)):
