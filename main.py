@@ -78,6 +78,10 @@ def init_db():
         conn.execute("""CREATE TABLE IF NOT EXISTS quest_completions (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, quest_key TEXT NOT NULL,
             round INTEGER NOT NULL DEFAULT 1, completed_at TEXT NOT NULL, kdate TEXT NOT NULL)""")
+        # 가족 연결 (다대다): 어르신 1명에 보호자 여러 명, 보호자 1명에 어르신 여러 명
+        conn.execute("""CREATE TABLE IF NOT EXISTS family_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, senior_id INTEGER NOT NULL, guardian_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL, UNIQUE(senior_id, guardian_id))""")
         # 가족 일정 (다음 만남 약속, 기념일). 연결된 가족 둘 다 홈에서 볼 수 있어요.
         conn.execute("""CREATE TABLE IF NOT EXISTS family_plans (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, title TEXT NOT NULL, plan_date TEXT NOT NULL,
@@ -109,6 +113,7 @@ def init_db():
             ("quest_progress", "media_count", "INTEGER NOT NULL DEFAULT 0"),
             ("activities", "response_ms", "INTEGER"),
             ("users", "phone", "TEXT NOT NULL DEFAULT ''"),
+            ("timeline_posts", "circle_senior_id", "INTEGER"), ("family_plans", "senior_id", "INTEGER"), ("quest_completions", "circle_senior_id", "INTEGER"),
             ("timeline_posts", "source_progress_id", "INTEGER UNIQUE"),
             ("users", "email_verified", "INTEGER NOT NULL DEFAULT 0"),
         ]: add_column(conn, table, column, definition)
@@ -153,6 +158,16 @@ def migrate_completions():
         for row in rows:
             conn.execute("INSERT INTO quest_completions (user_id,quest_key,round,completed_at,kdate) VALUES (?,?,1,?,?)", (row["user_id"], row["quest_key"], row["completed_at"], row["completed_at"][:10]))
 migrate_completions()
+def migrate_family_links():
+    with get_db() as conn:
+        for row in conn.execute("SELECT s.id AS senior, g.id AS guardian FROM users s JOIN users g ON g.id = s.linked_user_id WHERE s.role = 'senior' AND g.role = 'guardian' UNION SELECT s.id, g.id FROM users g JOIN users s ON s.id = g.linked_user_id WHERE g.role = 'guardian' AND s.role = 'senior'").fetchall():
+            conn.execute("INSERT OR IGNORE INTO family_links (senior_id,guardian_id,created_at) VALUES (?,?,?)", (row[0], row[1], now()))
+        # 게시물·일정·퀘스트 완료가 어느 어르신 가족 것인지 채워 넣기 (어르신 글은 본인, 보호자 글은 처음 연결한 어르신)
+        for table, author in (("timeline_posts", "author_id"), ("family_plans", "user_id"), ("quest_completions", "user_id")):
+            column = "senior_id" if table == "family_plans" else "circle_senior_id"
+            conn.execute(f"UPDATE {table} SET {column} = {author} WHERE {column} IS NULL AND {author} IN (SELECT id FROM users WHERE role = 'senior')")
+            conn.execute(f"UPDATE {table} SET {column} = (SELECT MIN(senior_id) FROM family_links WHERE guardian_id = {table}.{author}) WHERE {column} IS NULL")
+migrate_family_links()
 def password_hash(password: str):
     salt = secrets.token_hex(16)
     return f"{salt}${hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 120000).hex()}"
@@ -163,19 +178,49 @@ def make_code(conn):
     while True:
         code = "CARE-" + secrets.token_hex(3).upper()
         if not conn.execute("SELECT 1 FROM users WHERE invite_code = ?", (code,)).fetchone(): return code
-def current_user(authorization: Optional[str] = Header(default=None)):
+FAMILY_LIMIT = 10  # 한 계정에 연결할 수 있는 가족 수
+def family_ids(conn, user_id: int, role: str):
+    # 어르신이면 연결된 보호자들, 보호자면 연결된 어르신들 (연결한 순서대로)
+    sql = "SELECT guardian_id AS other FROM family_links WHERE senior_id = ? ORDER BY id" if role == "senior" else "SELECT senior_id AS other FROM family_links WHERE guardian_id = ? ORDER BY id"
+    return [row["other"] for row in conn.execute(sql, (user_id,)).fetchall()]
+def guardians_of(conn, senior_id: int): return family_ids(conn, senior_id, "senior")
+def circle_members(conn, senior_id: int): return [senior_id] + guardians_of(conn, senior_id)
+def in_circle(conn, senior_id, user_id: int):
+    return bool(senior_id) and (user_id == senior_id or bool(conn.execute("SELECT 1 FROM family_links WHERE senior_id = ? AND guardian_id = ?", (senior_id, user_id)).fetchone()))
+def sync_primary(conn, user_id: int):
+    # 예전 앱과의 호환을 위해 users.linked_user_id에는 처음 연결한 가족을 남겨 둡니다.
+    row = conn.execute("SELECT role FROM users WHERE id = ?", (user_id,)).fetchone()
+    if row: first = family_ids(conn, user_id, row["role"]); conn.execute("UPDATE users SET linked_user_id = ? WHERE id = ?", (first[0] if first else None, user_id))
+def make_link(conn, a, b):
+    if a["role"] == b["role"]: raise HTTPException(status_code=400, detail="보호자와 시니어 코드끼리만 연결할 수 있어요.")
+    senior, guardian = (a, b) if a["role"] == "senior" else (b, a)
+    if conn.execute("SELECT 1 FROM family_links WHERE senior_id = ? AND guardian_id = ?", (senior["id"], guardian["id"])).fetchone(): raise HTTPException(status_code=400, detail="이미 연결된 가족이에요.")
+    for person in (senior, guardian):
+        if len(family_ids(conn, person["id"], person["role"])) >= FAMILY_LIMIT: raise HTTPException(status_code=400, detail=f"{person['name']}님은 이미 가족 {FAMILY_LIMIT}명과 연결되어 있어요.")
+    conn.execute("INSERT INTO family_links (senior_id,guardian_id,created_at) VALUES (?,?,?)", (senior["id"], guardian["id"], now()))
+    sync_primary(conn, senior["id"]); sync_primary(conn, guardian["id"])
+def current_user(authorization: Optional[str] = Header(default=None), x_senior_id: Optional[str] = Header(default=None, alias="X-Senior-Id")):
     if not authorization or not authorization.startswith("Bearer "): raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
     with get_db() as conn:
         row = conn.execute("SELECT u.* FROM users u JOIN sessions s ON u.id = s.user_id WHERE s.token = ?", (authorization.removeprefix("Bearer "),)).fetchone()
-    if not row: raise HTTPException(status_code=401, detail="로그인이 만료되었습니다.")
-    return row
+        if not row: raise HTTPException(status_code=401, detail="로그인이 만료되었습니다.")
+        user = dict(row); user["family_ids"] = family_ids(conn, row["id"], row["role"])
+    # circle = 지금 보고 있는 '어르신 가족'. 어르신은 자기 자신, 보호자는 앱에서 고른 어르신(연결된 경우에만).
+    if user["role"] == "senior":
+        user["circle"] = user["id"]; user["linked_user_id"] = user["family_ids"][0] if user["family_ids"] else None
+    else:
+        chosen = int(x_senior_id) if x_senior_id and x_senior_id.isdigit() else None
+        user["circle"] = chosen if chosen in user["family_ids"] else (user["family_ids"][0] if user["family_ids"] else None)
+        user["linked_user_id"] = user["circle"]  # 보호자 화면은 '선택한 어르신' 기준으로 계산돼요
+    return user
 def admin_emails(): return {email.strip().lower() for email in os.getenv("ADMIN_EMAILS", "").split(",") if email.strip()}
 def is_admin(user): return user["email"].strip().lower() in admin_emails()
 def require_admin(user=Depends(current_user)):
     if not is_admin(user): raise HTTPException(status_code=403, detail="관리자만 글을 관리할 수 있습니다.")
     return user
 def profile(row):
-    return {"id": row["id"], "name": row["name"], "email": row["email"], "role": row["role"], "invite_code": row["invite_code"], "linked_user_id": row["linked_user_id"], "is_linked": bool(row["linked_user_id"]), "is_admin": is_admin(row), "email_verified": bool(row["email_verified"]) if "email_verified" in row.keys() else False, "phone": (row["phone"] if "phone" in row.keys() else "") or ""}
+    with get_db() as conn: count = len(family_ids(conn, row["id"], row["role"]))
+    return {"id": row["id"], "name": row["name"], "email": row["email"], "role": row["role"], "invite_code": row["invite_code"], "linked_user_id": row["linked_user_id"], "is_linked": count > 0, "family_count": count, "is_admin": is_admin(row), "email_verified": bool(row["email_verified"]) if "email_verified" in row.keys() else False, "phone": (row["phone"] if "phone" in row.keys() else "") or ""}
 def activity_owner(user): return user["linked_user_id"] if user["role"] == "guardian" and user["linked_user_id"] else user["id"]
 RELATION_PERIOD_DAYS = 7
 GUARDIAN_OVERVIEW_DAYS = 7
@@ -208,7 +253,7 @@ def progress_dict(row): return dict(row) | {"completed": bool(row["completed"]),
 def allowed_post(post_id: int, user, conn):
     row = conn.execute("SELECT * FROM timeline_posts WHERE id = ? AND deleted_at IS NULL", (post_id,)).fetchone()
     if not row: raise HTTPException(status_code=404, detail="게시물을 찾을 수 없습니다.")
-    if row["author_id"] not in (user["id"], user["linked_user_id"]): raise HTTPException(status_code=403, detail="연결된 가족의 게시물만 볼 수 있습니다.")
+    if row["author_id"] != user["id"] and not in_circle(conn, row["circle_senior_id"], user["id"]): raise HTTPException(status_code=403, detail="연결된 가족의 게시물만 볼 수 있습니다.")
     return row
 def post_dict(row, user_id, conn):
     post_id = row["id"]
@@ -239,13 +284,12 @@ def health(): return {"ok": True}
 def signup(payload: SignUpInput):
     if payload.role not in ("guardian", "senior"): raise HTTPException(status_code=400, detail="가입 유형을 선택해 주세요.")
     with get_db() as conn:
-        linked_id = None; code = payload.partner_code.strip().upper()
+        linked_id = None; partner = None; code = payload.partner_code.strip().upper()
         if code:
             partner = conn.execute("SELECT * FROM users WHERE invite_code = ?", (code,)).fetchone()
             if not partner: raise HTTPException(status_code=400, detail="연결 코드를 찾을 수 없습니다.")
             if partner["role"] == payload.role: raise HTTPException(status_code=400, detail="보호자와 시니어 코드는 서로 연결할 수 있어요.")
-            if partner["linked_user_id"]: raise HTTPException(status_code=400, detail="이미 연결된 코드입니다.")
-            linked_id = partner["id"]
+            if len(family_ids(conn, partner["id"], partner["role"])) >= FAMILY_LIMIT: raise HTTPException(status_code=400, detail=f"이 코드의 가족은 이미 {FAMILY_LIMIT}명과 연결되어 있어요.")
         verified = 0
         if mail_enabled():
             if conn.execute("SELECT 1 FROM users WHERE email = ?", (payload.email.strip().lower(),)).fetchone(): raise HTTPException(status_code=400, detail="이미 사용 중인 이메일입니다.")
@@ -253,7 +297,7 @@ def signup(payload: SignUpInput):
         try: cursor = conn.execute("INSERT INTO users (name,email,password_hash,role,invite_code,linked_user_id,created_at,email_verified) VALUES (?,?,?,?,?,?,?,?)", (payload.name.strip(), payload.email.strip().lower(), password_hash(payload.password), payload.role, make_code(conn), linked_id, now(), verified))
         except sqlite3.IntegrityError: raise HTTPException(status_code=400, detail="이미 사용 중인 이메일입니다.")
         user_id = cursor.lastrowid
-        if linked_id: conn.execute("UPDATE users SET linked_user_id = ? WHERE id = ?", (user_id, linked_id))
+        if partner: make_link(conn, partner, conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone())
         user = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone(); token = secrets.token_urlsafe(32); conn.execute("INSERT INTO sessions (token,user_id,created_at) VALUES (?,?,?)", (token, user_id, now()))
     return {"token": token, "user": profile(user)}
 @app.post("/api/auth/login")
@@ -265,13 +309,14 @@ def login(payload: LoginInput):
     return {"token": token, "user": profile(user)}
 @app.post("/api/auth/link")
 def link_partner(payload: LinkInput, user=Depends(current_user)):
-    if user["linked_user_id"]: raise HTTPException(status_code=400, detail="이미 연결된 계정입니다.")
+    # 이미 연결된 가족이 있어도 코드로 가족을 더 추가할 수 있어요. (최대 FAMILY_LIMIT명)
     with get_db() as conn:
         partner = conn.execute("SELECT * FROM users WHERE invite_code = ?", (payload.partner_code.strip().upper(),)).fetchone()
         if not partner: raise HTTPException(status_code=400, detail="연결 코드를 찾을 수 없습니다.")
+        if partner["id"] == user["id"]: raise HTTPException(status_code=400, detail="내 코드가 아니라 가족의 코드를 입력해 주세요.")
         if partner["role"] == user["role"]: raise HTTPException(status_code=400, detail="반대 역할의 코드를 입력해 주세요.")
-        if partner["linked_user_id"]: raise HTTPException(status_code=400, detail="이미 연결된 코드입니다.")
-        conn.execute("UPDATE users SET linked_user_id = ? WHERE id = ?", (partner["id"], user["id"])); conn.execute("UPDATE users SET linked_user_id = ? WHERE id = ?", (user["id"], partner["id"])); updated = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+        make_link(conn, user, partner)
+        updated = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
     return {"user": profile(updated)}
 @app.post("/api/auth/logout")
 def logout(authorization: Optional[str] = Header(default=None)):
@@ -367,14 +412,18 @@ def reset_password(payload: PasswordResetInput):
 def find_email(payload: FindEmailInput):
     partner_email = normalize_email(payload.partner_email)
     with get_db() as conn:
-        partner = conn.execute("SELECT linked_user_id FROM users WHERE email = ?", (partner_email,)).fetchone()
-        user = conn.execute("SELECT email, name FROM users WHERE id = ?", (partner["linked_user_id"],)).fetchone() if partner and partner["linked_user_id"] else None
-    if not user or user["name"].strip() != payload.name.strip(): raise HTTPException(status_code=404, detail="일치하는 계정을 찾지 못했어요. 이름과 가족 이메일을 확인해 주세요.")
+        partner = conn.execute("SELECT id, role FROM users WHERE email = ?", (partner_email,)).fetchone()
+        candidates = [conn.execute("SELECT email, name FROM users WHERE id = ?", (fid,)).fetchone() for fid in family_ids(conn, partner["id"], partner["role"])] if partner else []
+        user = next((c for c in candidates if c and c["name"].strip() == payload.name.strip()), None)
+    if not user: raise HTTPException(status_code=404, detail="일치하는 계정을 찾지 못했어요. 이름과 가족 이메일을 확인해 주세요.")
     return {"email_hint": mask_email(user["email"])}
 @app.get("/api/account")
 def account(user=Depends(current_user)):
-    with get_db() as conn: partner = conn.execute("SELECT name, email, role, phone FROM users WHERE id = ?", (user["linked_user_id"],)).fetchone() if user["linked_user_id"] else None
-    return {"user": profile(user), "partner": dict(partner) if partner else None, "mail_enabled": mail_enabled()}
+    with get_db() as conn:
+        family = [dict(row) for row in (conn.execute("SELECT id, name, email, role, phone FROM users WHERE id = ?", (fid,)).fetchone() for fid in user["family_ids"]) if row]
+    # partner: 보호자는 지금 고른 어르신, 어르신은 처음 연결한 보호자 (예전 앱 호환)
+    partner = next((f for f in family if f["id"] == user["linked_user_id"]), family[0] if family else None)
+    return {"user": profile(user), "family": family, "partner": partner, "selected_senior_id": user["circle"] if user["role"] == "guardian" else user["id"], "family_limit": FAMILY_LIMIT, "mail_enabled": mail_enabled()}
 @app.patch("/api/account/name")
 def change_name(payload: NameInput, user=Depends(current_user)):
     name = payload.name.strip()
@@ -400,15 +449,16 @@ def create_plan(payload: PlanInput, user=Depends(current_user)):
     try: datetime.fromisoformat(payload.date)
     except ValueError: raise HTTPException(status_code=400, detail="날짜를 다시 골라 주세요.")
     if not title: raise HTTPException(status_code=400, detail="일정 이름을 적어 주세요.")
+    if not user["circle"]: raise HTTPException(status_code=400, detail="먼저 가족과 연결해 주세요.")
     with get_db() as conn:
-        plan_id = conn.execute("INSERT INTO family_plans (user_id,title,plan_date,quest_key,created_at) VALUES (?,?,?,?,?)", (user["id"], title, payload.date[:10], payload.quest_key[:60], now())).lastrowid
+        plan_id = conn.execute("INSERT INTO family_plans (user_id,title,plan_date,quest_key,created_at,senior_id) VALUES (?,?,?,?,?,?)", (user["id"], title, payload.date[:10], payload.quest_key[:60], now(), user["circle"])).lastrowid
         row = conn.execute("SELECT p.*, u.name AS author_name FROM family_plans p JOIN users u ON u.id = p.user_id WHERE p.id = ?", (plan_id,)).fetchone()
     return plan_dict(row, user["id"])
 @app.get("/api/plans/upcoming")
 def upcoming_plans(user=Depends(current_user)):
-    ids = [user["id"]] + ([user["linked_user_id"]] if user["linked_user_id"] else [])
+    if not user["circle"]: return []
     with get_db() as conn:
-        rows = conn.execute(f"SELECT p.*, u.name AS author_name FROM family_plans p JOIN users u ON u.id = p.user_id WHERE p.user_id IN ({','.join('?' for _ in ids)}) AND p.deleted_at IS NULL AND p.plan_date >= ? ORDER BY p.plan_date, p.id LIMIT 3", (*ids, today_korea())).fetchall()
+        rows = conn.execute("SELECT p.*, u.name AS author_name FROM family_plans p JOIN users u ON u.id = p.user_id WHERE p.senior_id = ? AND p.deleted_at IS NULL AND p.plan_date >= ? ORDER BY p.plan_date, p.id LIMIT 3", (user["circle"], today_korea())).fetchall()
     return [plan_dict(row, user["id"]) for row in rows]
 @app.delete("/api/plans/{plan_id}")
 def delete_plan(plan_id: int, user=Depends(current_user)):
@@ -437,16 +487,21 @@ def verify_email(payload: CodeInput, user=Depends(current_user)):
         check_code(conn, user["email"], "verify", payload.code)
         conn.execute("UPDATE users SET email_verified = 1 WHERE id = ?", (user["id"],)); row = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
     return {"user": profile(row)}
+class UnlinkInput(BaseModel): user_id: Optional[int] = None
 @app.post("/api/account/unlink")
-def unlink(user=Depends(current_user)):
-    if not user["linked_user_id"]: raise HTTPException(status_code=400, detail="연결된 가족이 없어요.")
+def unlink(payload: Optional[UnlinkInput] = None, user=Depends(current_user)):
+    target = payload.user_id if payload and payload.user_id else (user["family_ids"][0] if len(user["family_ids"]) == 1 else None)
+    if not user["family_ids"]: raise HTTPException(status_code=400, detail="연결된 가족이 없어요.")
+    if target not in user["family_ids"]: raise HTTPException(status_code=400, detail="연결을 해제할 가족을 골라 주세요.")
     with get_db() as conn:
-        conn.execute("UPDATE users SET linked_user_id = NULL WHERE id IN (?, ?)", (user["id"], user["linked_user_id"])); row = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+        conn.execute("DELETE FROM family_links WHERE (senior_id = ? AND guardian_id = ?) OR (senior_id = ? AND guardian_id = ?)", (user["id"], target, target, user["id"]))
+        sync_primary(conn, user["id"]); sync_primary(conn, target)
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
     return {"user": profile(row)}
 @app.post("/api/account/role")
 def change_role(payload: RoleInput, user=Depends(current_user)):
     if payload.role not in ("guardian", "senior"): raise HTTPException(status_code=400, detail="모드를 다시 선택해 주세요.")
-    if user["linked_user_id"]: raise HTTPException(status_code=400, detail="가족 연결을 해제한 뒤 모드를 바꿀 수 있어요.")
+    if user["family_ids"]: raise HTTPException(status_code=400, detail="가족 연결을 모두 해제한 뒤 모드를 바꿀 수 있어요.")
     with get_db() as conn: conn.execute("UPDATE users SET role = ? WHERE id = ?", (payload.role, user["id"])); row = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
     return {"user": profile(row)}
 @app.post("/api/account/delete")
@@ -464,7 +519,9 @@ def delete_account(payload: DeleteAccountInput, user=Depends(current_user)):
         for table in ("sessions", "activities", "quests", "app_state", "user_app_state", "quest_progress", "quest_completions", "mood_checkins", "meetup_interests", "family_plans"):
             conn.execute(f"DELETE FROM {table} WHERE user_id = ?", (uid,))
         conn.execute("DELETE FROM email_codes WHERE email = ?", (user["email"],))
+        conn.execute("DELETE FROM family_links WHERE senior_id = ? OR guardian_id = ?", (uid, uid))
         conn.execute("UPDATE users SET linked_user_id = NULL WHERE linked_user_id = ?", (uid,))
+        for other in user["family_ids"]: sync_primary(conn, other)
         conn.execute("DELETE FROM users WHERE id = ?", (uid,))
     for name in files:
         try: os.remove(os.path.join(UPLOAD_DIR, os.path.basename(name)))
@@ -533,7 +590,8 @@ def quest_progress(user=Depends(current_user)):
     return [progress_dict(row) for row in rows]
 @app.get("/api/family-timeline")
 def family_timeline(user=Depends(current_user)):
-    ids = [user["id"]] + ([user["linked_user_id"]] if user["linked_user_id"] else []); marks = ",".join("?" for _ in ids)
+    with get_db() as conn: ids = circle_members(conn, user["circle"]) if user["circle"] else [user["id"]]
+    marks = ",".join("?" for _ in ids)
     with get_db() as conn: rows = conn.execute(f"SELECT q.*, u.name AS author_name FROM quest_progress q JOIN users u ON u.id=q.user_id WHERE q.user_id = ? OR (q.user_id IN ({marks}) AND q.is_shared = 1) ORDER BY q.completed_at DESC", [user["id"], *ids]).fetchall()
     return [progress_dict(row) | {"is_mine": row["user_id"] == user["id"]} for row in rows]
 @app.post("/api/quest-progress")
@@ -542,11 +600,11 @@ def complete_quest(payload: QuestProgressInput, user=Depends(current_user)):
     with get_db() as conn:
         today_count = conn.execute("SELECT COUNT(*) FROM quest_completions WHERE user_id = ? AND kdate = ?", (user["id"], today_korea())).fetchone()[0]
         if today_count >= QUEST_DAILY_LIMIT: raise HTTPException(status_code=429, detail=f"오늘은 퀘스트를 {QUEST_DAILY_LIMIT}개 모두 했어요. 내일 또 만나요!")
-        conn.execute("INSERT INTO quest_completions (user_id,quest_key,round,completed_at,kdate) VALUES (?,?,?,?,?)", (user["id"], payload.quest_key, quest_round(conn, user["id"]), timestamp, today_korea()))
+        conn.execute("INSERT INTO quest_completions (user_id,quest_key,round,completed_at,kdate,circle_senior_id) VALUES (?,?,?,?,?,?)", (user["id"], payload.quest_key, quest_round(conn, user["id"]), timestamp, today_korea(), user["circle"]))
         conn.execute("""INSERT INTO quest_progress (user_id,quest_key,title,role,completed,reflection,result_summary,completed_at,is_shared,media_kind,media_count) VALUES (?,?,?,?,1,?,?,?,?,?,?) ON CONFLICT(user_id,quest_key) DO UPDATE SET completed=1, reflection=excluded.reflection, result_summary=excluded.result_summary, completed_at=excluded.completed_at, is_shared=excluded.is_shared, media_kind=excluded.media_kind, media_count=excluded.media_count""", (user["id"],payload.quest_key,payload.title,user["role"],payload.reflection.strip(),payload.result_summary.strip(),timestamp,int(payload.is_shared),payload.media_kind,max(0,payload.media_count)))
         row = conn.execute("SELECT * FROM quest_progress WHERE user_id = ? AND quest_key = ?", (user["id"], payload.quest_key)).fetchone()
         post_id = None
-        if payload.is_shared: post_id = conn.execute("INSERT INTO timeline_posts (author_id,quest_key,title,body,result_summary,created_at) VALUES (?,?,?,?,?,?)", (user["id"], payload.quest_key, payload.title, payload.reflection.strip(), payload.result_summary.strip(), timestamp)).lastrowid
+        if payload.is_shared: post_id = conn.execute("INSERT INTO timeline_posts (author_id,quest_key,title,body,result_summary,created_at,circle_senior_id) VALUES (?,?,?,?,?,?,?)", (user["id"], payload.quest_key, payload.title, payload.reflection.strip(), payload.result_summary.strip(), timestamp, user["circle"])).lastrowid
     return progress_dict(row) | {"post_id": post_id, "today_count": today_count + 1}
 def quest_round(conn, user_id: int):
     row = conn.execute("SELECT state_value FROM user_app_state WHERE user_id = ? AND state_key = 'quest_round'", (user_id,)).fetchone()
@@ -568,9 +626,10 @@ def next_quest_round(user=Depends(current_user)):
         return quest_status(conn, user["id"])
 @app.get("/api/timeline")
 def timeline(before_id: Optional[int] = None, limit: int = 20, user=Depends(current_user)):
-    safe_limit = min(max(limit, 1), 20); ids = [user["id"]] + ([user["linked_user_id"]] if user["linked_user_id"] else []); marks = ",".join("?" for _ in ids)
-    sql = f"SELECT p.*, u.name AS author_name, u.role AS author_role FROM timeline_posts p JOIN users u ON u.id=p.author_id WHERE p.deleted_at IS NULL AND p.author_id IN ({marks})"
-    params = list(ids)
+    safe_limit = min(max(limit, 1), 20)
+    # 같은 어르신 가족(어르신 + 연결된 보호자들)이 이 어르신에게 올린 게시물. 가족이 없으면 내 게시물만.
+    sql = "SELECT p.*, u.name AS author_name, u.role AS author_role FROM timeline_posts p JOIN users u ON u.id=p.author_id WHERE p.deleted_at IS NULL AND " + ("p.circle_senior_id = ?" if user["circle"] else "p.author_id = ?")
+    params = [user["circle"] or user["id"]]
     if before_id: sql += " AND p.id < ?"; params.append(before_id)
     sql += " ORDER BY p.id DESC LIMIT ?"; params.append(safe_limit)
     with get_db() as conn: rows = conn.execute(sql, params).fetchall(); return [post_dict(row, user["id"], conn) for row in rows]
@@ -721,7 +780,7 @@ def guardian_overview(user=Depends(current_user)):
         activity_now = conn.execute("SELECT COUNT(*) AS count, COALESCE(SUM(is_correct),0) AS correct FROM activities WHERE user_id = ? AND date(completed_at) BETWEEN ? AND ?", (senior_id, start.isoformat(), end.isoformat())).fetchone()
         activity_prev = conn.execute("SELECT COUNT(*) AS count FROM activities WHERE user_id = ? AND date(completed_at) BETWEEN ? AND ?", (senior_id, previous_start.isoformat(), previous_end.isoformat())).fetchone()["count"]
         moods = conn.execute("SELECT mood, COUNT(*) AS count FROM mood_checkins WHERE user_id = ? AND checkin_date BETWEEN ? AND ? GROUP BY mood", (senior_id, start.isoformat(), end.isoformat())).fetchall(); mood_counts = {row["mood"]: row["count"] for row in moods}
-        family_ids = (senior_id, user["id"]); marks = ",".join("?" for _ in family_ids)
+        family_ids = tuple(circle_members(conn, senior_id)); marks = ",".join("?" for _ in family_ids)
         shared_now = conn.execute(f"SELECT COUNT(*) AS count FROM timeline_posts WHERE author_id IN ({marks}) AND deleted_at IS NULL AND date(created_at) BETWEEN ? AND ?", (*family_ids, start.isoformat(), end.isoformat())).fetchone()["count"]
         comments_now = conn.execute(f"SELECT COUNT(*) AS count FROM post_comments WHERE user_id IN ({marks}) AND deleted_at IS NULL AND date(created_at) BETWEEN ? AND ?", (*family_ids, start.isoformat(), end.isoformat())).fetchone()["count"]
         likes_now = conn.execute(f"SELECT COUNT(*) AS count FROM post_likes WHERE user_id IN ({marks}) AND date(created_at) BETWEEN ? AND ?", (*family_ids, start.isoformat(), end.isoformat())).fetchone()["count"]
@@ -807,16 +866,17 @@ def _speed_baseline(conn, senior_id: int, day: str):
         values = _valid_ms(_day_answers(conn, senior_id, _day_shift(day, -back)))
         if values: medians.append(_median(values))
     return _median(medians) if len(medians) >= REPORT_SPEED_MIN_DAYS else None
-def report_day(conn, senior_id: int, partner_id, day: str, with_speed: bool = True):
-    P = REPORT_POINTS; members = [senior_id] + ([partner_id] if partner_id else [])
-    done = conn.execute(f"SELECT c.user_id, c.quest_key, (SELECT title FROM quest_progress q WHERE q.user_id = c.user_id AND q.quest_key = c.quest_key) AS title FROM quest_completions c WHERE c.user_id IN ({_marks(members)}) AND c.kdate = ?", (*members, day)).fetchall()
+def report_day(conn, senior_id: int, guardian_ids, day: str, with_speed: bool = True):
+    P = REPORT_POINTS; members = [senior_id] + list(guardian_ids or [])
+    # 보호자의 퀘스트는 이 어르신을 골라 두고 한 것만 셉니다.
+    done = conn.execute(f"SELECT c.user_id, c.quest_key, (SELECT title FROM quest_progress q WHERE q.user_id = c.user_id AND q.quest_key = c.quest_key) AS title FROM quest_completions c WHERE c.user_id IN ({_marks(members)}) AND c.kdate = ? AND (c.user_id = ? OR c.circle_senior_id = ?)", (*members, day, senior_id, senior_id)).fetchall()
     mine = [row for row in done if row["user_id"] == senior_id]
     of = lambda rows, cat: [row for row in rows if QUEST_CATEGORIES.get(row["quest_key"]) == cat]
     titles = lambda rows: ", ".join(dict.fromkeys(row["title"] or row["quest_key"] for row in rows))
     count = lambda sql, *args: conn.execute(sql, args).fetchone()[0]
-    shares = count(f"SELECT COUNT(*) FROM timeline_posts WHERE author_id IN ({_marks(members)}) AND deleted_at IS NULL AND substr(created_at,1,10) = ?", *members, day)
-    comments = count(f"SELECT COUNT(*) FROM post_comments WHERE user_id IN ({_marks(members)}) AND deleted_at IS NULL AND substr(created_at,1,10) = ?", *members, day)
-    likes = count(f"SELECT COUNT(*) FROM post_likes WHERE user_id IN ({_marks(members)}) AND substr(created_at,1,10) = ?", *members, day)
+    shares = count("SELECT COUNT(*) FROM timeline_posts WHERE circle_senior_id = ? AND deleted_at IS NULL AND substr(created_at,1,10) = ?", senior_id, day)
+    comments = count("SELECT COUNT(*) FROM post_comments c JOIN timeline_posts p ON p.id = c.post_id WHERE p.circle_senior_id = ? AND c.deleted_at IS NULL AND substr(c.created_at,1,10) = ?", senior_id, day)
+    likes = count("SELECT COUNT(*) FROM post_likes l JOIN timeline_posts p ON p.id = l.post_id WHERE p.circle_senior_id = ? AND substr(l.created_at,1,10) = ?", senior_id, day)
     items = {}
     # 1. 오늘의 연락 (시니어·보호자 둘 다)
     contact_q = of(done, "contact")
@@ -892,7 +952,7 @@ def daily_report(user=Depends(current_user)):
     if user["role"] == "guardian" and not user["linked_user_id"]: return {"linked": False}
     with get_db() as conn:
         senior = conn.execute("SELECT * FROM users WHERE id = ?", (senior_id,)).fetchone()
-        partner_id = senior["linked_user_id"]; today = today_korea()
+        partner_id = guardians_of(conn, senior_id); today = today_korea()
         # 신호등 기준일: 가입일이 아니라 '처음 기록을 남긴 날' (기능이 생기기 전 가입한 계정도 공정하게)
         signup = conn.execute("""SELECT MIN(day) FROM (
             SELECT MIN(kdate) AS day FROM quest_completions WHERE user_id = :sid
@@ -975,7 +1035,7 @@ def guardian_report(days: int = 7, user=Depends(current_user)):
         activities = conn.execute("SELECT activity_type,is_correct,completed_at FROM activities WHERE user_id = ? AND date(completed_at) BETWEEN ? AND ?", (senior_id, start.isoformat(), end.isoformat())).fetchall()
         moods = conn.execute("SELECT checkin_date,mood FROM mood_checkins WHERE user_id = ? AND checkin_date BETWEEN ? AND ? ORDER BY checkin_date", (senior_id, start.isoformat(), end.isoformat())).fetchall()
         progress = conn.execute("SELECT user_id,completed_at FROM quest_progress WHERE user_id IN (?,?) AND completed = 1 AND date(completed_at) BETWEEN ? AND ?", (senior_id, user["id"], start.isoformat(), end.isoformat())).fetchall()
-        family_ids = (senior_id, user["id"]); marks = ",".join("?" for _ in family_ids)
+        family_ids = tuple(circle_members(conn, senior_id)); marks = ",".join("?" for _ in family_ids)
         shared = conn.execute(f"SELECT COUNT(*) AS count FROM timeline_posts WHERE author_id IN ({marks}) AND deleted_at IS NULL AND date(created_at) BETWEEN ? AND ?", (*family_ids, start.isoformat(), end.isoformat())).fetchone()["count"]
         comments = conn.execute(f"SELECT COUNT(*) AS count FROM post_comments WHERE user_id IN ({marks}) AND deleted_at IS NULL AND date(created_at) BETWEEN ? AND ?", (*family_ids, start.isoformat(), end.isoformat())).fetchone()["count"]
         likes = conn.execute(f"SELECT COUNT(*) AS count FROM post_likes WHERE user_id IN ({marks}) AND date(created_at) BETWEEN ? AND ?", (*family_ids, start.isoformat(), end.isoformat())).fetchone()["count"]
