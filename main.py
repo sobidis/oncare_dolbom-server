@@ -18,6 +18,8 @@ DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(os.path.abspath
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "uploads"))
 MEDIA_MAX_BYTES = 5 * 1024 * 1024
 MEDIA_MAX_PER_POST = 5
+AUDIO_MAX_BYTES = 10 * 1024 * 1024  # 녹음은 약 10분 분량까지
+QUEST_DAILY_LIMIT = 3  # 하루에 완료할 수 있는 퀘스트 수
 # 메일 발송 설정 (Gmail/네이버 메일의 앱 비밀번호). 비어 있으면 이메일 인증 없이 가입됩니다.
 SMTP_HOST = os.environ.get("SMTP_HOST", "")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
@@ -72,6 +74,10 @@ def init_db():
         conn.execute("""CREATE TABLE IF NOT EXISTS meetup_interests (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, meetup_key TEXT NOT NULL,
             created_at TEXT NOT NULL, UNIQUE(user_id, meetup_key))""")
+        # 퀘스트를 완료할 때마다 한 줄씩 쌓는 기록 (quest_progress는 퀘스트당 한 줄이라 다시 하면 덮어써짐)
+        conn.execute("""CREATE TABLE IF NOT EXISTS quest_completions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, quest_key TEXT NOT NULL,
+            round INTEGER NOT NULL DEFAULT 1, completed_at TEXT NOT NULL, kdate TEXT NOT NULL)""")
         conn.execute("""CREATE TABLE IF NOT EXISTS email_codes (
             id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, purpose TEXT NOT NULL, code_hash TEXT NOT NULL,
             expires_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, used_at INTEGER, created_at INTEGER NOT NULL)""")
@@ -111,12 +117,36 @@ def now(): return datetime.now(KOREA).isoformat(timespec="seconds")
 def today_korea(): return datetime.now(KOREA).date().isoformat()
 def migrate_shared_progress():
     with get_db() as conn:
-        rows = conn.execute("SELECT * FROM quest_progress WHERE is_shared = 1 AND completed = 1").fetchall()
+        # 예전에 공유된 기록 중 타임라인에 아직 없는 것만 옮깁니다.
+        # (이미 같은 글쓴이·퀘스트·시각의 게시물이 있으면 건너뜀 — 재시작할 때마다 중복되던 문제 수정)
+        rows = conn.execute("""SELECT q.* FROM quest_progress q WHERE q.is_shared = 1 AND q.completed = 1
+            AND NOT EXISTS (SELECT 1 FROM timeline_posts p WHERE p.author_id = q.user_id AND p.quest_key = q.quest_key AND p.created_at = q.completed_at)""").fetchall()
         for row in rows:
             conn.execute("""INSERT OR IGNORE INTO timeline_posts
                 (author_id,quest_key,title,body,result_summary,created_at,source_progress_id)
                 VALUES (?,?,?,?,?,?,?)""", (row["user_id"], row["quest_key"], row["title"], row["reflection"] or "", row["result_summary"] or "", row["completed_at"] or now(), row["id"]))
+def remove_duplicate_posts():
+    # 위 문제로 이미 생긴 중복 게시물 정리: 댓글·좋아요·사진을 원래 게시물로 옮긴 뒤 복사본을 지웁니다.
+    with get_db() as conn:
+        pairs = conn.execute("""SELECT d.id AS dup, MIN(o.id) AS orig FROM timeline_posts d JOIN timeline_posts o
+            ON o.author_id = d.author_id AND o.quest_key = d.quest_key AND o.created_at = d.created_at AND o.id != d.id AND o.source_progress_id IS NULL
+            WHERE d.source_progress_id IS NOT NULL GROUP BY d.id""").fetchall()
+        for pair in pairs:
+            dup, orig = pair["dup"], pair["orig"]
+            conn.execute("UPDATE post_media SET post_id = ? WHERE post_id = ?", (orig, dup))
+            conn.execute("UPDATE post_comments SET post_id = ? WHERE post_id = ?", (orig, dup))
+            conn.execute("UPDATE OR IGNORE post_likes SET post_id = ? WHERE post_id = ?", (orig, dup))
+            conn.execute("DELETE FROM post_likes WHERE post_id = ?", (dup,))
+            conn.execute("DELETE FROM timeline_posts WHERE id = ?", (dup,))
+remove_duplicate_posts()
 migrate_shared_progress()
+def migrate_completions():
+    with get_db() as conn:
+        rows = conn.execute("""SELECT q.user_id, q.quest_key, q.completed_at FROM quest_progress q WHERE q.completed = 1 AND q.completed_at IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM quest_completions c WHERE c.user_id = q.user_id AND c.quest_key = q.quest_key)""").fetchall()
+        for row in rows:
+            conn.execute("INSERT INTO quest_completions (user_id,quest_key,round,completed_at,kdate) VALUES (?,?,1,?,?)", (row["user_id"], row["quest_key"], row["completed_at"], row["completed_at"][:10]))
+migrate_completions()
 def password_hash(password: str):
     salt = secrets.token_hex(16)
     return f"{salt}${hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 120000).hex()}"
@@ -388,7 +418,7 @@ def delete_account(payload: DeleteAccountInput, user=Depends(current_user)):
         conn.execute(f"DELETE FROM post_likes WHERE user_id = ? OR post_id IN ({marks})", (uid, *post_ids))
         conn.execute(f"DELETE FROM post_comments WHERE user_id = ? OR post_id IN ({marks})", (uid, *post_ids))
         conn.execute("DELETE FROM timeline_posts WHERE author_id = ?", (uid,))
-        for table in ("sessions", "activities", "quests", "app_state", "user_app_state", "quest_progress", "mood_checkins", "meetup_interests"):
+        for table in ("sessions", "activities", "quests", "app_state", "user_app_state", "quest_progress", "quest_completions", "mood_checkins", "meetup_interests"):
             conn.execute(f"DELETE FROM {table} WHERE user_id = ?", (uid,))
         conn.execute("DELETE FROM email_codes WHERE email = ?", (user["email"],))
         conn.execute("UPDATE users SET linked_user_id = NULL WHERE linked_user_id = ?", (uid,))
@@ -465,11 +495,32 @@ def family_timeline(user=Depends(current_user)):
 def complete_quest(payload: QuestProgressInput, user=Depends(current_user)):
     timestamp = now()
     with get_db() as conn:
+        today_count = conn.execute("SELECT COUNT(*) FROM quest_completions WHERE user_id = ? AND kdate = ?", (user["id"], today_korea())).fetchone()[0]
+        if today_count >= QUEST_DAILY_LIMIT: raise HTTPException(status_code=429, detail=f"오늘은 퀘스트를 {QUEST_DAILY_LIMIT}개 모두 했어요. 내일 또 만나요!")
+        conn.execute("INSERT INTO quest_completions (user_id,quest_key,round,completed_at,kdate) VALUES (?,?,?,?,?)", (user["id"], payload.quest_key, quest_round(conn, user["id"]), timestamp, today_korea()))
         conn.execute("""INSERT INTO quest_progress (user_id,quest_key,title,role,completed,reflection,result_summary,completed_at,is_shared,media_kind,media_count) VALUES (?,?,?,?,1,?,?,?,?,?,?) ON CONFLICT(user_id,quest_key) DO UPDATE SET completed=1, reflection=excluded.reflection, result_summary=excluded.result_summary, completed_at=excluded.completed_at, is_shared=excluded.is_shared, media_kind=excluded.media_kind, media_count=excluded.media_count""", (user["id"],payload.quest_key,payload.title,user["role"],payload.reflection.strip(),payload.result_summary.strip(),timestamp,int(payload.is_shared),payload.media_kind,max(0,payload.media_count)))
         row = conn.execute("SELECT * FROM quest_progress WHERE user_id = ? AND quest_key = ?", (user["id"], payload.quest_key)).fetchone()
         post_id = None
         if payload.is_shared: post_id = conn.execute("INSERT INTO timeline_posts (author_id,quest_key,title,body,result_summary,created_at) VALUES (?,?,?,?,?,?)", (user["id"], payload.quest_key, payload.title, payload.reflection.strip(), payload.result_summary.strip(), timestamp)).lastrowid
-    return progress_dict(row) | {"post_id": post_id}
+    return progress_dict(row) | {"post_id": post_id, "today_count": today_count + 1}
+def quest_round(conn, user_id: int):
+    row = conn.execute("SELECT state_value FROM user_app_state WHERE user_id = ? AND state_key = 'quest_round'", (user_id,)).fetchone()
+    return int(row["state_value"]) if row else 1
+def quest_status(conn, user_id: int):
+    round_no = quest_round(conn, user_id)
+    keys = [row["quest_key"] for row in conn.execute("SELECT DISTINCT quest_key FROM quest_completions WHERE user_id = ? AND round = ?", (user_id, round_no)).fetchall()]
+    today = conn.execute("SELECT COUNT(*) FROM quest_completions WHERE user_id = ? AND kdate = ?", (user_id, today_korea())).fetchone()[0]
+    return {"round": round_no, "completed_keys": keys, "today_count": today, "daily_limit": QUEST_DAILY_LIMIT}
+@app.get("/api/quest-status")
+def get_quest_status(user=Depends(current_user)):
+    with get_db() as conn: return quest_status(conn, user["id"])
+@app.post("/api/quest-round/next")
+def next_quest_round(user=Depends(current_user)):
+    # 모든 단계를 마친 뒤 '처음부터 다시 도전하기'
+    with get_db() as conn:
+        next_round = quest_round(conn, user["id"]) + 1
+        conn.execute("INSERT OR REPLACE INTO user_app_state (user_id,state_key,state_value,updated_at) VALUES (?,'quest_round',?,?)", (user["id"], str(next_round), now()))
+        return quest_status(conn, user["id"])
 @app.get("/api/timeline")
 def timeline(before_id: Optional[int] = None, limit: int = 20, user=Depends(current_user)):
     safe_limit = min(max(limit, 1), 20); ids = [user["id"]] + ([user["linked_user_id"]] if user["linked_user_id"] else []); marks = ",".join("?" for _ in ids)
@@ -515,6 +566,12 @@ def delete_post(post_id: int, user=Depends(current_user)):
         conn.execute("UPDATE timeline_posts SET deleted_at = ? WHERE id = ?", (now(),post_id))
     return {"ok": True}
 def image_type(data: bytes):
+    # 사진과 녹음 파일을 실제 내용으로 구분합니다. (확장자나 요청 헤더는 믿지 않음)
+    if data[:4] == b"\x1a\x45\xdf\xa3": return "audio/webm", ".webm"
+    if data[:4] == b"OggS": return "audio/ogg", ".ogg"
+    if data[4:8] == b"ftyp": return "audio/mp4", ".m4a"
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE": return "audio/wav", ".wav"
+    if data[:3] == b"ID3" or (len(data) > 1 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0 and data[:3] != b"\xff\xd8\xff"): return "audio/mpeg", ".mp3"
     if data.startswith(b"\xff\xd8\xff"): return "image/jpeg", ".jpg"
     if data.startswith(b"\x89PNG\r\n\x1a\n"): return "image/png", ".png"
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP": return "image/webp", ".webp"
@@ -524,15 +581,23 @@ async def upload_media(post_id: int, request: Request, user=Depends(current_user
     # 사진 파일 자체를 요청 본문으로 받습니다. (추가 패키지 없이 동작)
     with get_db() as conn:
         post = allowed_post(post_id, user, conn)
-        if post["author_id"] != user["id"]: raise HTTPException(status_code=403, detail="내 게시물에만 사진을 올릴 수 있습니다.")
-        if conn.execute("SELECT COUNT(*) FROM post_media WHERE post_id = ?", (post_id,)).fetchone()[0] >= MEDIA_MAX_PER_POST:
-            raise HTTPException(status_code=400, detail=f"사진은 게시물당 {MEDIA_MAX_PER_POST}장까지 올릴 수 있어요.")
+        if post["author_id"] != user["id"]: raise HTTPException(status_code=403, detail="내 게시물에만 사진이나 녹음을 올릴 수 있습니다.")
     data = b""
     async for chunk in request.stream():
         data += chunk
-        if len(data) > MEDIA_MAX_BYTES: raise HTTPException(status_code=400, detail="사진은 한 장에 5MB까지 올릴 수 있어요.")
+        if len(data) > AUDIO_MAX_BYTES: raise HTTPException(status_code=400, detail="파일이 너무 커요. 녹음은 10MB, 사진은 5MB까지 올릴 수 있어요.")
     content_type, ext = image_type(data)
-    if not content_type: raise HTTPException(status_code=400, detail="jpg, png, webp 사진만 올릴 수 있어요.")
+    if not content_type: raise HTTPException(status_code=400, detail="jpg, png, webp 사진이나 녹음 파일만 올릴 수 있어요.")
+    is_audio = content_type.startswith("audio/")
+    if not is_audio and len(data) > MEDIA_MAX_BYTES: raise HTTPException(status_code=400, detail="사진은 한 장에 5MB까지 올릴 수 있어요.")
+    if not is_audio:
+        with get_db() as conn:
+            if conn.execute("SELECT COUNT(*) FROM post_media WHERE post_id = ? AND content_type LIKE 'image/%'", (post_id,)).fetchone()[0] >= MEDIA_MAX_PER_POST:
+                raise HTTPException(status_code=400, detail=f"사진은 게시물당 {MEDIA_MAX_PER_POST}장까지 올릴 수 있어요.")
+    if is_audio:
+        with get_db() as conn:
+            if conn.execute("SELECT COUNT(*) FROM post_media WHERE post_id = ? AND content_type LIKE 'audio/%'", (post_id,)).fetchone()[0] >= 1:
+                raise HTTPException(status_code=400, detail="녹음은 게시물당 1개까지 올릴 수 있어요.")
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     file_name = secrets.token_hex(16) + ext
     with open(os.path.join(UPLOAD_DIR, file_name), "wb") as f: f.write(data)
