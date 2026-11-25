@@ -802,7 +802,10 @@ def report_day(conn, senior_id: int, partner_id, day: str, with_speed: bool = Tr
     raw = P["brain_solve"] * solved + P["brain_correct"] * correct
     score = (raw + speed) if speed is not None else round(raw / ((P["brain_solve"] + P["brain_correct"]) * REPORT_DAILY_QUESTIONS) * 100)
     speed_text = "" if speed is None else (" · 평소보다 빨리 풀었어요" if today_ms <= base_ms * 0.9 else " · 평소와 비슷한 속도예요" if today_ms <= base_ms * 1.2 else " · 평소보다 천천히 풀었어요")
-    items["brain"] = {"score": score if solved else 0, "detail": f"{solved}문제 중 {correct}문제를 맞혔어요{speed_text}" if solved else "오늘의 5문제를 아직 풀지 않았어요",
+    if today_ms and base_ms: time_text = f" · 풀이 시간 {round(today_ms / 1000, 1)}초(평소 {round(base_ms / 1000, 1)}초){speed_text.replace(' · ', ', ')}"
+    elif today_ms: time_text = f" · 풀이 시간 {round(today_ms / 1000, 1)}초 (기록이 7일 이상 쌓이면 평소와 비교해요)"
+    else: time_text = ""
+    items["brain"] = {"score": score if solved else 0, "detail": f"{solved}문제 중 {correct}문제를 맞혔어요{time_text}" if solved else "오늘의 5문제를 아직 풀지 않았어요",
                       "solved": solved, "correct": correct, "median_seconds": round(today_ms / 1000, 1) if today_ms else None, "base_seconds": round(base_ms / 1000, 1) if base_ms else None, "speed_score": speed}
     counted = [item["score"] for item in items.values() if item["score"] is not None]
     return {"date": day, "items": items, "overall": round(sum(counted) / len(counted)) if counted else 0}
@@ -843,11 +846,20 @@ def daily_report(user=Depends(current_user)):
     if user["role"] == "guardian" and not user["linked_user_id"]: return {"linked": False}
     with get_db() as conn:
         senior = conn.execute("SELECT * FROM users WHERE id = ?", (senior_id,)).fetchone()
-        partner_id = senior["linked_user_id"]; today = today_korea(); signup = (senior["created_at"] or today)[:10]
+        partner_id = senior["linked_user_id"]; today = today_korea()
+        # 신호등 기준일: 가입일이 아니라 '처음 기록을 남긴 날' (기능이 생기기 전 가입한 계정도 공정하게)
+        signup = conn.execute("""SELECT MIN(day) FROM (
+            SELECT MIN(kdate) AS day FROM quest_completions WHERE user_id = :sid
+            UNION ALL SELECT MIN(substr(completed_at,1,10)) FROM activities WHERE user_id = :sid
+            UNION ALL SELECT MIN(checkin_date) FROM mood_checkins WHERE user_id = :sid
+            UNION ALL SELECT MIN(substr(created_at,1,10)) FROM timeline_posts WHERE author_id = :sid AND deleted_at IS NULL)""", {"sid": senior_id}).fetchone()[0] or "9999-12-31"
         days = [report_day(conn, senior_id, partner_id, _day_shift(today, -back), with_speed=True) for back in range(13, -1, -1)]
         this_week, last_week = days[7:], days[:7]
-        window = [d for d in this_week if d["date"] >= signup] or [this_week[-1]]
-        signal_score = round(sum(d["overall"] for d in window) / len(window))
+        # 처음 7일은 쌓인 날만큼 평균(1일차는 1일차만, 2일차는 1~2일차…), 그 뒤로는 최근 7일 평균.
+        # 오늘 아직 기록이 없으면 오늘은 빼요. (아침에 앱을 열자마자 신호가 떨어지지 않게)
+        window = [d for d in this_week if d["date"] >= signup and (d["date"] < today or d["overall"] > 0)]
+        signal_score = round(sum(d["overall"] for d in window) / len(window)) if window else None
+        signal_days = len(window)
         def week_avg(group, key):
             values = [d["items"][key]["score"] for d in group if d["items"][key]["score"] is not None and d["date"] >= signup]
             return round(sum(values) / len(values)) if values else None
@@ -865,13 +877,14 @@ def daily_report(user=Depends(current_user)):
             trend = "" if last is None else f" (지난주 {last}점)" if last == avg else f" (지난주 {last}점보다 {'낮아요' if avg < last else '높아요'})"
             recs.append({"title": GUARDIAN_TIPS[key][0], "reason": f"이번 주 {REPORT_LABELS[key]} 평균 {avg}점{trend}. {GUARDIAN_TIPS[key][1]}"})
         if not recs: recs.append({"title": "지금처럼 함께해 주세요", "reason": "이번 주 활동이 고르게 이어지고 있어요. 꾸준한 관심이 가장 큰 돌봄이에요."})
+        window = window or [this_week[-1]]  # 아래 꾸준함 계산용 (기록이 없으면 오늘 하루)
         consistency = {"quest_days": sum(1 for d in window if d["items"]["quest"]["score"]), "brain_days": sum(1 for d in window if d["items"]["brain"]["solved"]),
                        "mood_days": sum(1 for d in window if d["items"]["mind"]["mood"]), "days": len(window)}
         brain_7 = _brain_window(conn, senior_id, _day_shift(today, -6), today); brain_30 = _brain_window(conn, senior_id, _day_shift(today, -29), today)
     return {
         "linked": True, "senior_name": senior["name"], "date": today,
         "items": [{"key": key, "label": REPORT_LABELS[key], **today_report["items"][key]} for key in REPORT_LABELS],
-        "overall": today_report["overall"], "signal_score": signal_score, "signal_days": len(window),
+        "overall": today_report["overall"], "signal_score": signal_score, "signal_days": signal_days,
         "days": [{"date": d["date"], "overall": d["overall"], "scores": {k: v["score"] for k, v in d["items"].items()}} for d in this_week],
         "compare": compare, "consistency": consistency, "senior_tip": senior_tip, "recommendations": recs[:3],
         "brain": {"change": brain_change, "week": {"all": brain_7[0], "by_type": brain_7[1]}, "month": {"all": brain_30[0], "by_type": brain_30[1]}},
