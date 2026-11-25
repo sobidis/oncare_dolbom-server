@@ -78,6 +78,10 @@ def init_db():
         conn.execute("""CREATE TABLE IF NOT EXISTS quest_completions (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, quest_key TEXT NOT NULL,
             round INTEGER NOT NULL DEFAULT 1, completed_at TEXT NOT NULL, kdate TEXT NOT NULL)""")
+        # 가족 일정 (다음 만남 약속, 기념일). 연결된 가족 둘 다 홈에서 볼 수 있어요.
+        conn.execute("""CREATE TABLE IF NOT EXISTS family_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, title TEXT NOT NULL, plan_date TEXT NOT NULL,
+            quest_key TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, deleted_at TEXT)""")
         conn.execute("""CREATE TABLE IF NOT EXISTS email_codes (
             id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, purpose TEXT NOT NULL, code_hash TEXT NOT NULL,
             expires_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, used_at INTEGER, created_at INTEGER NOT NULL)""")
@@ -104,6 +108,7 @@ def init_db():
             ("quest_progress", "is_shared", "INTEGER NOT NULL DEFAULT 0"), ("quest_progress", "media_kind", "TEXT DEFAULT ''"),
             ("quest_progress", "media_count", "INTEGER NOT NULL DEFAULT 0"),
             ("activities", "response_ms", "INTEGER"),
+            ("users", "phone", "TEXT NOT NULL DEFAULT ''"),
             ("timeline_posts", "source_progress_id", "INTEGER UNIQUE"),
             ("users", "email_verified", "INTEGER NOT NULL DEFAULT 0"),
         ]: add_column(conn, table, column, definition)
@@ -170,7 +175,7 @@ def require_admin(user=Depends(current_user)):
     if not is_admin(user): raise HTTPException(status_code=403, detail="관리자만 글을 관리할 수 있습니다.")
     return user
 def profile(row):
-    return {"id": row["id"], "name": row["name"], "email": row["email"], "role": row["role"], "invite_code": row["invite_code"], "linked_user_id": row["linked_user_id"], "is_linked": bool(row["linked_user_id"]), "is_admin": is_admin(row), "email_verified": bool(row["email_verified"]) if "email_verified" in row.keys() else False}
+    return {"id": row["id"], "name": row["name"], "email": row["email"], "role": row["role"], "invite_code": row["invite_code"], "linked_user_id": row["linked_user_id"], "is_linked": bool(row["linked_user_id"]), "is_admin": is_admin(row), "email_verified": bool(row["email_verified"]) if "email_verified" in row.keys() else False, "phone": (row["phone"] if "phone" in row.keys() else "") or ""}
 def activity_owner(user): return user["linked_user_id"] if user["role"] == "guardian" and user["linked_user_id"] else user["id"]
 RELATION_PERIOD_DAYS = 7
 GUARDIAN_OVERVIEW_DAYS = 7
@@ -368,7 +373,7 @@ def find_email(payload: FindEmailInput):
     return {"email_hint": mask_email(user["email"])}
 @app.get("/api/account")
 def account(user=Depends(current_user)):
-    with get_db() as conn: partner = conn.execute("SELECT name, email, role FROM users WHERE id = ?", (user["linked_user_id"],)).fetchone() if user["linked_user_id"] else None
+    with get_db() as conn: partner = conn.execute("SELECT name, email, role, phone FROM users WHERE id = ?", (user["linked_user_id"],)).fetchone() if user["linked_user_id"] else None
     return {"user": profile(user), "partner": dict(partner) if partner else None, "mail_enabled": mail_enabled()}
 @app.patch("/api/account/name")
 def change_name(payload: NameInput, user=Depends(current_user)):
@@ -376,6 +381,43 @@ def change_name(payload: NameInput, user=Depends(current_user)):
     if not name: raise HTTPException(status_code=400, detail="이름을 입력해 주세요.")
     with get_db() as conn: conn.execute("UPDATE users SET name = ? WHERE id = ?", (name, user["id"])); row = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
     return {"user": profile(row)}
+class PhoneInput(BaseModel): phone: str = Field(default="", max_length=20)
+@app.patch("/api/account/phone")
+def change_phone(payload: PhoneInput, user=Depends(current_user)):
+    # 전화번호는 연결된 가족만 볼 수 있어요. 비우면 삭제돼요.
+    phone = payload.phone.strip()
+    digits = re.sub(r"[^0-9]", "", phone)
+    if phone and (not re.fullmatch(r"[0-9+\- ]+", phone) or not 9 <= len(digits) <= 13): raise HTTPException(status_code=400, detail="전화번호를 다시 확인해 주세요. (예: 010-1234-5678)")
+    with get_db() as conn: conn.execute("UPDATE users SET phone = ? WHERE id = ?", (phone, user["id"])); row = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+    return {"user": profile(row)}
+class PlanInput(BaseModel): title: str = Field(min_length=1, max_length=40); date: str; quest_key: str = ""
+def plan_dict(row, user_id):
+    days = (datetime.fromisoformat(row["plan_date"]).date() - datetime.fromisoformat(today_korea()).date()).days
+    return {"id": row["id"], "title": row["title"], "date": row["plan_date"], "d_day": days, "author_name": row["author_name"], "is_mine": row["user_id"] == user_id}
+@app.post("/api/plans")
+def create_plan(payload: PlanInput, user=Depends(current_user)):
+    title = payload.title.strip()
+    try: datetime.fromisoformat(payload.date)
+    except ValueError: raise HTTPException(status_code=400, detail="날짜를 다시 골라 주세요.")
+    if not title: raise HTTPException(status_code=400, detail="일정 이름을 적어 주세요.")
+    with get_db() as conn:
+        plan_id = conn.execute("INSERT INTO family_plans (user_id,title,plan_date,quest_key,created_at) VALUES (?,?,?,?,?)", (user["id"], title, payload.date[:10], payload.quest_key[:60], now())).lastrowid
+        row = conn.execute("SELECT p.*, u.name AS author_name FROM family_plans p JOIN users u ON u.id = p.user_id WHERE p.id = ?", (plan_id,)).fetchone()
+    return plan_dict(row, user["id"])
+@app.get("/api/plans/upcoming")
+def upcoming_plans(user=Depends(current_user)):
+    ids = [user["id"]] + ([user["linked_user_id"]] if user["linked_user_id"] else [])
+    with get_db() as conn:
+        rows = conn.execute(f"SELECT p.*, u.name AS author_name FROM family_plans p JOIN users u ON u.id = p.user_id WHERE p.user_id IN ({','.join('?' for _ in ids)}) AND p.deleted_at IS NULL AND p.plan_date >= ? ORDER BY p.plan_date, p.id LIMIT 3", (*ids, today_korea())).fetchall()
+    return [plan_dict(row, user["id"]) for row in rows]
+@app.delete("/api/plans/{plan_id}")
+def delete_plan(plan_id: int, user=Depends(current_user)):
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM family_plans WHERE id = ? AND deleted_at IS NULL", (plan_id,)).fetchone()
+        if not row: raise HTTPException(status_code=404, detail="일정을 찾을 수 없어요.")
+        if row["user_id"] != user["id"]: raise HTTPException(status_code=403, detail="내가 만든 일정만 지울 수 있어요.")
+        conn.execute("UPDATE family_plans SET deleted_at = ? WHERE id = ?", (now(), plan_id))
+    return {"ok": True}
 @app.post("/api/account/password")
 def change_password(payload: PasswordChangeInput, user=Depends(current_user), authorization: Optional[str] = Header(default=None)):
     if not password_ok(payload.current_password, user["password_hash"]): raise HTTPException(status_code=400, detail="지금 비밀번호가 맞지 않아요.")
@@ -419,7 +461,7 @@ def delete_account(payload: DeleteAccountInput, user=Depends(current_user)):
         conn.execute(f"DELETE FROM post_likes WHERE user_id = ? OR post_id IN ({marks})", (uid, *post_ids))
         conn.execute(f"DELETE FROM post_comments WHERE user_id = ? OR post_id IN ({marks})", (uid, *post_ids))
         conn.execute("DELETE FROM timeline_posts WHERE author_id = ?", (uid,))
-        for table in ("sessions", "activities", "quests", "app_state", "user_app_state", "quest_progress", "quest_completions", "mood_checkins", "meetup_interests"):
+        for table in ("sessions", "activities", "quests", "app_state", "user_app_state", "quest_progress", "quest_completions", "mood_checkins", "meetup_interests", "family_plans"):
             conn.execute(f"DELETE FROM {table} WHERE user_id = ?", (uid,))
         conn.execute("DELETE FROM email_codes WHERE email = ?", (user["email"],))
         conn.execute("UPDATE users SET linked_user_id = NULL WHERE linked_user_id = ?", (uid,))
@@ -740,6 +782,10 @@ QUEST_CATEGORIES = {
     "senior-school-friend": "brain", "senior-holiday": "brain", "senior-recipe": "contact", "senior-first-pay": "brain", "senior-child": "brain",
     "senior-trip": "brain", "senior-folk-tale": "contact", "senior-happiest-day": "mind", "senior-motto": "mind", "senior-self-cheer": "mind",
     "senior-wish": "mind", "guardian-hello": "contact", "guardian-calendar": "mind", "guardian-letter": "contact", "guardian-story": "contact",
+    "guardian-evening-call": "contact", "guardian-voice-hello": "contact", "guardian-day-photo": "contact", "guardian-comment": "contact",
+    "guardian-favorite-song": "contact", "guardian-next-visit": "contact", "guardian-praise": "contact", "guardian-old-photo": "contact",
+    "guardian-my-childhood": "contact", "guardian-recipe": "contact", "guardian-dream": "contact", "guardian-walk": "contact",
+    "guardian-thanks": "contact", "guardian-phone-tip": "contact", "guardian-gift": "contact", "guardian-health": "contact",
 }
 MOOD_TEXT = {"good": "좋아요", "okay": "보통", "hard": "힘들어요"}
 COG_TYPE_LABEL = {"날짜": "날짜·시간", "계산": "계산", "기억": "기억", "언어": "말·속담", "상식": "생활 상식"}
