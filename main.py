@@ -103,6 +103,7 @@ def init_db():
             ("activities", "user_id", "INTEGER"), ("quests", "user_id", "INTEGER"), ("app_state", "user_id", "INTEGER"),
             ("quest_progress", "is_shared", "INTEGER NOT NULL DEFAULT 0"), ("quest_progress", "media_kind", "TEXT DEFAULT ''"),
             ("quest_progress", "media_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("activities", "response_ms", "INTEGER"),
             ("timeline_posts", "source_progress_id", "INTEGER UNIQUE"),
             ("users", "email_verified", "INTEGER NOT NULL DEFAULT 0"),
         ]: add_column(conn, table, column, definition)
@@ -212,7 +213,7 @@ def post_dict(row, user_id, conn):
 class SignUpInput(BaseModel): name: str = Field(min_length=1, max_length=30); email: str = Field(min_length=3, max_length=100); password: str = Field(min_length=4, max_length=100); role: str; partner_code: str = ""; email_code: str = ""
 class LoginInput(BaseModel): email: str; password: str
 class LinkInput(BaseModel): partner_code: str
-class ActivityInput(BaseModel): activity_type: str; question: str; answer: str; correct_answer: str; is_correct: bool; encouragement: str
+class ActivityInput(BaseModel): activity_type: str; question: str; answer: str; correct_answer: str; is_correct: bool; encouragement: str; response_ms: Optional[int] = None
 class QuestInput(BaseModel): title: str; completed: bool; reflection: str = ""
 class QuestProgressInput(BaseModel): quest_key: str; title: str; reflection: str = ""; result_summary: str = ""; is_shared: bool = False; media_kind: str = ""; media_count: int = 0
 class AppStateInput(BaseModel): mode: str = "home"; step: int = 0
@@ -470,7 +471,9 @@ def list_activities(days: Optional[int] = None, activity_type: Optional[str] = N
 def create_activity(payload: ActivityInput, user=Depends(current_user)):
     if user["role"] != "senior": raise HTTPException(status_code=403, detail="시니어 계정에서만 활동을 기록할 수 있습니다.")
     with get_db() as conn:
-        cursor = conn.execute("INSERT INTO activities (activity_type,question,answer,correct_answer,is_correct,encouragement,completed_at,user_id) VALUES (?,?,?,?,?,?,?,?)", (payload.activity_type,payload.question,payload.answer,payload.correct_answer,int(payload.is_correct),payload.encouragement,now(),user["id"])); row = conn.execute("SELECT * FROM activities WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        # 풀이 시간(밀리초)은 0~10분 사이만 저장합니다. 리포트 계산에서는 2분이 넘는 값은 빼요.
+        response_ms = payload.response_ms if payload.response_ms is not None and 0 < payload.response_ms <= 600000 else None
+        cursor = conn.execute("INSERT INTO activities (activity_type,question,answer,correct_answer,is_correct,encouragement,completed_at,user_id,response_ms) VALUES (?,?,?,?,?,?,?,?,?)", (payload.activity_type,payload.question,payload.answer,payload.correct_answer,int(payload.is_correct),payload.encouragement,now(),user["id"],response_ms)); row = conn.execute("SELECT * FROM activities WHERE id = ?", (cursor.lastrowid,)).fetchone()
     return dict(row) | {"is_correct": bool(row["is_correct"])}
 @app.get("/api/quests")
 def list_quests(user=Depends(current_user)):
@@ -715,6 +718,164 @@ def guardian_overview(user=Depends(current_user)):
     }
     recommendation = recommendation_map[concerning["key"] if concerning["status"] != "stable" else "activity"] if concerning["status"] != "stable" else {"title": "지금처럼 함께해 주세요", "body": "꾸준한 관심이 가장 큰 돌봄이에요.", "action": "none"}
     return {"senior": {"name": senior["name"] if senior else None, "linked": True, "last_activity_at": last_activity}, "status": overall, "signals": signals, "recommendation": recommendation}
+# ---------- 관계 리포트 (활동 기반 5항목) ----------
+# 배점과 기준은 여기서만 바꾸면 됩니다.
+REPORT_POINTS = {
+    "contact_quest": 40, "share": 30, "comment": 15, "like": 5,          # 연락
+    "quest_done": 50, "quest_share": 25, "quest_care": 25,                 # 오늘의 퀘스트
+    "mood": 50, "mind_quest": 50,                                          # 마음
+    "brain_solve": 4, "brain_correct": 12, "brain_speed": 20,              # 두뇌 (문제당 풀이·정답, 속도)
+}
+REPORT_DAILY_QUESTIONS = 5          # 오늘의 두뇌 체조 문제 수
+REPORT_CARE_TEXT_LEN = 30           # '정성 기록'으로 보는 글 길이
+REPORT_TIME_CAP_MS = 120000         # 2분이 넘는 풀이 시간은 계산에서 제외
+REPORT_SPEED_MIN_DAYS = 7           # 속도 점수에 필요한 이전 기록 일수
+REPORT_CHANGE = {"recent_days": 14, "base_days": 30, "min_answers": 10, "acc_drop": 20, "time_ratio": 1.5}
+REPORT_LABELS = {"contact": "오늘의 연락", "move": "신체 움직임", "quest": "오늘의 퀘스트", "mind": "마음", "brain": "두뇌 활동"}
+# 퀘스트 분류 (앱의 questData.ts와 같게 유지)
+QUEST_CATEGORIES = {
+    "senior-flowers": "move", "senior-selfie": "mind", "senior-diary": "brain", "senior-draw": "mind", "senior-thanks": "mind",
+    "senior-song": "mind", "senior-smile": "mind", "senior-season-walk": "move", "senior-praise": "contact", "senior-season-story": "brain",
+    "senior-old-song": "brain", "senior-gift": "brain", "senior-favorite-place": "move", "senior-ask-happy": "contact", "senior-hometown": "brain",
+    "senior-school-friend": "brain", "senior-holiday": "brain", "senior-recipe": "contact", "senior-first-pay": "brain", "senior-child": "brain",
+    "senior-trip": "brain", "senior-folk-tale": "contact", "senior-happiest-day": "mind", "senior-motto": "mind", "senior-self-cheer": "mind",
+    "senior-wish": "mind", "guardian-hello": "contact", "guardian-calendar": "mind", "guardian-letter": "contact", "guardian-story": "contact",
+}
+MOOD_TEXT = {"good": "좋아요", "okay": "보통", "hard": "힘들어요"}
+COG_TYPE_LABEL = {"날짜": "날짜·시간", "계산": "계산", "기억": "기억", "언어": "말·속담", "상식": "생활 상식"}
+def _median(values):
+    values = sorted(values)
+    if not values: return None
+    mid = len(values) // 2
+    return values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
+def _marks(ids): return ",".join("?" for _ in ids)
+def _day_shift(day: str, delta: int): return (datetime.fromisoformat(day) + timedelta(days=delta)).date().isoformat()
+def _day_answers(conn, senior_id: int, day: str):
+    # 그날 처음 푼 5문제 (한 번 더 풀기는 점수에 넣지 않음)
+    return conn.execute("SELECT activity_type, is_correct, response_ms FROM activities WHERE user_id = ? AND substr(completed_at,1,10) = ? ORDER BY id LIMIT ?", (senior_id, day, REPORT_DAILY_QUESTIONS)).fetchall()
+def _valid_ms(rows): return [row["response_ms"] for row in rows if row["response_ms"] and row["response_ms"] <= REPORT_TIME_CAP_MS]
+def _speed_baseline(conn, senior_id: int, day: str):
+    # 그날 이전 30일 동안의 '하루 풀이 시간 중간값'들의 중간값 (본인 평소)
+    medians = []
+    for back in range(1, 31):
+        values = _valid_ms(_day_answers(conn, senior_id, _day_shift(day, -back)))
+        if values: medians.append(_median(values))
+    return _median(medians) if len(medians) >= REPORT_SPEED_MIN_DAYS else None
+def report_day(conn, senior_id: int, partner_id, day: str, with_speed: bool = True):
+    P = REPORT_POINTS; members = [senior_id] + ([partner_id] if partner_id else [])
+    done = conn.execute(f"SELECT c.user_id, c.quest_key, (SELECT title FROM quest_progress q WHERE q.user_id = c.user_id AND q.quest_key = c.quest_key) AS title FROM quest_completions c WHERE c.user_id IN ({_marks(members)}) AND c.kdate = ?", (*members, day)).fetchall()
+    mine = [row for row in done if row["user_id"] == senior_id]
+    of = lambda rows, cat: [row for row in rows if QUEST_CATEGORIES.get(row["quest_key"]) == cat]
+    titles = lambda rows: ", ".join(dict.fromkeys(row["title"] or row["quest_key"] for row in rows))
+    count = lambda sql, *args: conn.execute(sql, args).fetchone()[0]
+    shares = count(f"SELECT COUNT(*) FROM timeline_posts WHERE author_id IN ({_marks(members)}) AND deleted_at IS NULL AND substr(created_at,1,10) = ?", *members, day)
+    comments = count(f"SELECT COUNT(*) FROM post_comments WHERE user_id IN ({_marks(members)}) AND deleted_at IS NULL AND substr(created_at,1,10) = ?", *members, day)
+    likes = count(f"SELECT COUNT(*) FROM post_likes WHERE user_id IN ({_marks(members)}) AND substr(created_at,1,10) = ?", *members, day)
+    items = {}
+    # 1. 오늘의 연락 (시니어·보호자 둘 다)
+    contact_q = of(done, "contact")
+    score = min(100, (P["contact_quest"] if contact_q else 0) + P["share"] * shares + P["comment"] * comments + P["like"] * likes)
+    parts = ([f"연락 퀘스트({titles(contact_q)})"] if contact_q else []) + ([f"가족 소식 공유 {shares}건"] if shares else []) + ([f"댓글 {comments}개"] if comments else []) + ([f"좋아요 {likes}개"] if likes else [])
+    items["contact"] = {"score": score, "detail": " · ".join(parts) if parts else "오늘은 가족과 주고받은 소식이 없어요"}
+    # 2. 신체 움직임 (기록이 없으면 종합에서 제외)
+    move_q = of(mine, "move")
+    items["move"] = {"score": 100 if move_q else None, "detail": f"{titles(move_q)} 완료" if move_q else "오늘은 움직임 기록이 없어요"}
+    # 3. 오늘의 퀘스트: 완료 + 가족 공유 + 정성 기록
+    my_posts = conn.execute("SELECT p.id, p.body, (SELECT COUNT(*) FROM post_media m WHERE m.post_id = p.id) AS media FROM timeline_posts p WHERE p.author_id = ? AND p.deleted_at IS NULL AND substr(p.created_at,1,10) = ?", (senior_id, day)).fetchall()
+    progress_rows = conn.execute("SELECT reflection, media_count FROM quest_progress WHERE user_id = ? AND substr(completed_at,1,10) = ?", (senior_id, day)).fetchall()
+    cared = any(row["media"] or len((row["body"] or "").strip()) >= REPORT_CARE_TEXT_LEN for row in my_posts) or any(row["media_count"] or len((row["reflection"] or "").strip()) >= REPORT_CARE_TEXT_LEN for row in progress_rows)
+    score = (P["quest_done"] if mine else 0) + (P["quest_share"] if mine and my_posts else 0) + (P["quest_care"] if mine and cared else 0)
+    parts = ([f"{titles(mine)} 완료"] if mine else []) + (["가족과 공유"] if mine and my_posts else []) + (["정성 기록(녹음·사진·글)"] if mine and cared else [])
+    items["quest"] = {"score": score, "detail": " · ".join(parts) if parts else "오늘은 아직 퀘스트를 하지 않았어요", "count": len(mine)}
+    # 4. 마음: 기분 기록 + 마음 퀘스트
+    mood = conn.execute("SELECT mood FROM mood_checkins WHERE user_id = ? AND checkin_date = ?", (senior_id, day)).fetchone()
+    mind_q = of(mine, "mind")
+    score = (P["mood"] if mood else 0) + (P["mind_quest"] if mind_q else 0)
+    parts = ([f"오늘 기분: {MOOD_TEXT.get(mood['mood'], mood['mood'])}"] if mood else []) + ([f"마음 퀘스트({titles(mind_q)})"] if mind_q else [])
+    items["mind"] = {"score": score, "detail": " · ".join(parts) if parts else "오늘은 아직 기분을 남기지 않았어요", "mood": mood["mood"] if mood else None}
+    # 5. 두뇌: 풀이 + 정답 + 속도(본인 평소 대비)
+    answers = _day_answers(conn, senior_id, day)
+    solved, correct = len(answers), sum(1 for row in answers if row["is_correct"])
+    today_ms = _median(_valid_ms(answers)); base_ms = _speed_baseline(conn, senior_id, day) if with_speed and today_ms else None
+    speed = None
+    if today_ms and base_ms: speed = P["brain_speed"] if today_ms <= base_ms else round(P["brain_speed"] * max(0.0, 1 - (today_ms / base_ms - 1)))
+    raw = P["brain_solve"] * solved + P["brain_correct"] * correct
+    score = (raw + speed) if speed is not None else round(raw / ((P["brain_solve"] + P["brain_correct"]) * REPORT_DAILY_QUESTIONS) * 100)
+    speed_text = "" if speed is None else (" · 평소보다 빨리 풀었어요" if today_ms <= base_ms * 0.9 else " · 평소와 비슷한 속도예요" if today_ms <= base_ms * 1.2 else " · 평소보다 천천히 풀었어요")
+    items["brain"] = {"score": score if solved else 0, "detail": f"{solved}문제 중 {correct}문제를 맞혔어요{speed_text}" if solved else "오늘의 5문제를 아직 풀지 않았어요",
+                      "solved": solved, "correct": correct, "median_seconds": round(today_ms / 1000, 1) if today_ms else None, "base_seconds": round(base_ms / 1000, 1) if base_ms else None, "speed_score": speed}
+    counted = [item["score"] for item in items.values() if item["score"] is not None]
+    return {"date": day, "items": items, "overall": round(sum(counted) / len(counted)) if counted else 0}
+def _brain_window(conn, senior_id: int, start: str, end: str):
+    rows = conn.execute("SELECT activity_type, is_correct, response_ms FROM activities WHERE user_id = ? AND substr(completed_at,1,10) BETWEEN ? AND ?", (senior_id, start, end)).fetchall()
+    def summary(subset):
+        ms = _valid_ms(subset)
+        return {"answers": len(subset), "accuracy": round(sum(1 for r in subset if r["is_correct"]) / len(subset) * 100) if subset else None, "median_seconds": round(_median(ms) / 1000, 1) if ms else None}
+    types = sorted({row["activity_type"] for row in rows})
+    return summary(rows), {t: summary([r for r in rows if r["activity_type"] == t]) for t in types}
+def _brain_change(conn, senior_id: int, today: str):
+    C = REPORT_CHANGE
+    recent_start = _day_shift(today, -(C["recent_days"] - 1)); base_end = _day_shift(recent_start, -1); base_start = _day_shift(base_end, -(C["base_days"] - 1))
+    recent, recent_types = _brain_window(conn, senior_id, recent_start, today)
+    base, base_types = _brain_window(conn, senior_id, base_start, base_end)
+    if recent["answers"] < C["min_answers"] or base["answers"] < C["min_answers"]:
+        return {"status": "insufficient", "message": "기록이 쌓이면(약 6주) 평소와 비교한 변화를 알려 드려요.", "recent": recent, "base": base}
+    found = []
+    subject = lambda name: "두뇌 체조" if name == "전체" else f"{COG_TYPE_LABEL.get(name, name)} 문제"
+    for name, now_s, base_s in [("전체", recent, base)] + [(t, recent_types[t], base_types[t]) for t in recent_types if t in base_types and recent_types[t]["answers"] >= 3 and base_types[t]["answers"] >= 3]:
+        if now_s["accuracy"] is not None and base_s["accuracy"] is not None and base_s["accuracy"] - now_s["accuracy"] >= C["acc_drop"]:
+            found.append(f"최근 2주 {subject(name)} 정답률이 평소보다 낮아졌어요 (평소 {base_s['accuracy']}% → 최근 {now_s['accuracy']}%)")
+        if now_s["median_seconds"] and base_s["median_seconds"] and now_s["median_seconds"] >= base_s["median_seconds"] * C["time_ratio"]:
+            found.append(f"최근 2주 {subject(name)} 풀이 시간이 평소보다 길어졌어요 (평소 {base_s['median_seconds']}초 → 최근 {now_s['median_seconds']}초)")
+    if found:
+        return {"status": "changed", "message": found[0] + ". 일시적일 수 있지만, 걱정되시면 가까운 치매안심센터나 전문가와 상담해 보세요.", "details": found, "recent": recent, "base": base}
+    return {"status": "stable", "message": "최근 2주 정답률과 풀이 시간이 평소와 비슷해요.", "recent": recent, "base": base}
+SENIOR_TIPS = {"contact": "오늘 한 일을 가족과 나눠 볼까요?", "quest": "오늘의 퀘스트를 하나 해 볼까요?", "mind": "오늘 기분을 남겨 볼까요?", "brain": "오늘의 두뇌 체조 5문제를 풀어 볼까요?"}
+GUARDIAN_TIPS = {
+    "contact": ("어르신 소식에 반응해 주세요", "가족 소식에 댓글이나 좋아요를 남기면 연락 점수가 올라가고, 어르신께 큰 힘이 돼요."),
+    "quest": ("퀘스트를 함께 응원해 주세요", "하루 한 개 퀘스트를 꾸준히 하실 수 있도록 안부 전화로 응원해 보세요."),
+    "mind": ("마음을 살펴 주세요", "기분 기록이 적거나 힘든 날이 있었어요. 짧은 통화로 마음을 나눠 보세요."),
+    "brain": ("두뇌 체조를 권해 주세요", "하루 5문제를 꾸준히 풀면 변화를 더 정확하게 살펴볼 수 있어요."),
+}
+@app.get("/api/report/daily")
+def daily_report(user=Depends(current_user)):
+    senior_id = activity_owner(user)
+    if user["role"] == "guardian" and not user["linked_user_id"]: return {"linked": False}
+    with get_db() as conn:
+        senior = conn.execute("SELECT * FROM users WHERE id = ?", (senior_id,)).fetchone()
+        partner_id = senior["linked_user_id"]; today = today_korea(); signup = (senior["created_at"] or today)[:10]
+        days = [report_day(conn, senior_id, partner_id, _day_shift(today, -back), with_speed=True) for back in range(13, -1, -1)]
+        this_week, last_week = days[7:], days[:7]
+        window = [d for d in this_week if d["date"] >= signup] or [this_week[-1]]
+        signal_score = round(sum(d["overall"] for d in window) / len(window))
+        def week_avg(group, key):
+            values = [d["items"][key]["score"] for d in group if d["items"][key]["score"] is not None and d["date"] >= signup]
+            return round(sum(values) / len(values)) if values else None
+        compare = {key: {"this_week": week_avg(this_week, key), "last_week": week_avg(last_week, key)} for key in REPORT_LABELS}
+        today_report = days[-1]
+        lowest_today = sorted((item["score"], key) for key, item in today_report["items"].items() if item["score"] is not None and key in SENIOR_TIPS)
+        senior_tip = SENIOR_TIPS[lowest_today[0][1]] if lowest_today and lowest_today[0][0] < 70 else "오늘도 정말 잘하셨어요!"
+        brain_change = _brain_change(conn, senior_id, today)
+        recs = []
+        if brain_change["status"] == "changed": recs.append({"title": "두뇌 체조 변화를 살펴봐 주세요", "reason": brain_change["message"]})
+        for key in sorted(GUARDIAN_TIPS, key=lambda k: compare[k]["this_week"] if compare[k]["this_week"] is not None else 0):
+            avg = compare[key]["this_week"]
+            if avg is None or avg >= 70 or len(recs) >= 3: continue
+            last = compare[key]["last_week"]
+            trend = "" if last is None else f" (지난주 {last}점)" if last == avg else f" (지난주 {last}점보다 {'낮아요' if avg < last else '높아요'})"
+            recs.append({"title": GUARDIAN_TIPS[key][0], "reason": f"이번 주 {REPORT_LABELS[key]} 평균 {avg}점{trend}. {GUARDIAN_TIPS[key][1]}"})
+        if not recs: recs.append({"title": "지금처럼 함께해 주세요", "reason": "이번 주 활동이 고르게 이어지고 있어요. 꾸준한 관심이 가장 큰 돌봄이에요."})
+        consistency = {"quest_days": sum(1 for d in window if d["items"]["quest"]["score"]), "brain_days": sum(1 for d in window if d["items"]["brain"]["solved"]),
+                       "mood_days": sum(1 for d in window if d["items"]["mind"]["mood"]), "days": len(window)}
+        brain_7 = _brain_window(conn, senior_id, _day_shift(today, -6), today); brain_30 = _brain_window(conn, senior_id, _day_shift(today, -29), today)
+    return {
+        "linked": True, "senior_name": senior["name"], "date": today,
+        "items": [{"key": key, "label": REPORT_LABELS[key], **today_report["items"][key]} for key in REPORT_LABELS],
+        "overall": today_report["overall"], "signal_score": signal_score, "signal_days": len(window),
+        "days": [{"date": d["date"], "overall": d["overall"], "scores": {k: v["score"] for k, v in d["items"].items()}} for d in this_week],
+        "compare": compare, "consistency": consistency, "senior_tip": senior_tip, "recommendations": recs[:3],
+        "brain": {"change": brain_change, "week": {"all": brain_7[0], "by_type": brain_7[1]}, "month": {"all": brain_30[0], "by_type": brain_30[1]}},
+    }
 @app.get("/api/report/relation")
 def get_relation_report(user=Depends(current_user)): return relation_report(user)
 @app.get("/api/summary")
